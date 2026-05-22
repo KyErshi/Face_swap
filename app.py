@@ -263,6 +263,9 @@ CSS = """
 h1 { text-align: center; margin-bottom: 0.5em; }
 .tab-nav { font-size: 1.1em; }
 footer { display: none !important; }
+/* 确保按钮不被视频播放器遮挡 */
+#video-swap-btn { position: relative; z-index: 100; clear: both; }
+video { max-width: 100%; }
 """
 
 
@@ -416,13 +419,13 @@ def build_app() -> gr.Blocks:
 
             # ========== Tab 2: 视频换脸 ==========
             with gr.TabItem("🎬 视频换脸"):
-                with gr.Row():
-                    with gr.Column():
+                with gr.Row(equal_height=False):
+                    with gr.Column(scale=1):
                         gr.Markdown("### 源人脸照片")
                         v_src_img = gr.Image(
                             label="上传源人脸",
                             type="numpy",
-                            height=300,
+                            height=250,
                         )
                         v_src_face_selector = gr.Dropdown(
                             choices=["上传后检测"],
@@ -430,14 +433,14 @@ def build_app() -> gr.Blocks:
                             label="选择源人脸",
                         )
 
-                    with gr.Column():
+                    with gr.Column(scale=1):
                         gr.Markdown("### 目标视频")
                         v_tgt_video = gr.Video(
                             label="上传目标视频",
-                            height=300,
+                            height=250,
                         )
 
-                with gr.Accordion("⚙️ 视频设置", open=True):
+                with gr.Accordion("⚙️ 视频设置", open=False):
                     with gr.Row():
                         v_keep_audio = gr.Checkbox(
                             label="保留原音频", value=True
@@ -456,15 +459,19 @@ def build_app() -> gr.Blocks:
                         label="处理时长 (秒, 0=全部)",
                     )
 
-                v_swap_btn = gr.Button(
-                    "🎥 开始视频换脸",
-                    variant="primary",
-                    size="lg",
-                )
+                with gr.Group():
+                    v_swap_btn = gr.Button(
+                        "🎥 开始视频换脸",
+                        variant="primary",
+                        size="lg",
+                        elem_id="video-swap-btn",
+                    )
+                    v_status = gr.Markdown("")
 
-                with gr.Row():
-                    v_output = gr.Video(label="换脸结果", height=350)
-                v_status = gr.Markdown("")
+                gr.Markdown("---")
+                with gr.Group():
+                    gr.Markdown("### 换脸结果")
+                    v_output = gr.Video(height=350)
 
                 def on_v_src_upload(img):
                     if img is None:
