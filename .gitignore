@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# 模型文件 (首次运行时自动下载)
+.insightface/
+
+# 临时文件
+*.tmp
+temp_*
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 环境
+.venv/
+venv/
