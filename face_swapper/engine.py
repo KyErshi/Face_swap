@@ -21,6 +21,7 @@ from .utils import (
     download_models,
     blend_images,
     get_model_path,
+    color_transfer,
 )
 
 logger = logging.getLogger(__name__)
@@ -172,6 +173,24 @@ class FaceSwapper:
             logger.error(f"模型初始化失败: {e}")
             raise RuntimeError(f"换脸引擎初始化失败: {e}")
 
+    def set_det_threshold(self, threshold: float):
+        """动态调整人脸检测阈值 (无需重启)
+
+        Args:
+            threshold: 0.0~1.0，越低越敏感 (更多误检)，越高越严格 (可能漏检)
+        """
+        self.det_threshold = max(0.01, min(0.99, threshold))
+        if self._initialized and self._face_analysis is not None:
+            try:
+                # re-prepare 以应用新阈值
+                self._face_analysis.prepare(
+                    ctx_id=0 if self.use_gpu else -1,
+                    det_thresh=self.det_threshold,
+                )
+                logger.info(f"检测阈值已更新为: {self.det_threshold:.2f}")
+            except Exception as e:
+                logger.warning(f"更新检测阈值失败: {e}")
+
     def detect_faces(self, img: np.ndarray) -> List[Any]:
         """检测图像中所有人脸
 
@@ -200,6 +219,7 @@ class FaceSwapper:
         target_face_idx: int = 0,
         enhance: bool = False,
         blend: bool = True,
+        color_match: bool = True,
     ) -> np.ndarray:
         """执行换脸
 
@@ -210,6 +230,7 @@ class FaceSwapper:
             target_face_idx: 目标图中第几张人脸 (默认第一张)
             enhance: 是否进行 GFPGAN 增强
             blend: 是否使用无缝融合
+            color_match: 是否进行颜色迁移，使肤色匹配目标环境
 
         Returns:
             换脸后的 BGR 图像
@@ -248,6 +269,30 @@ class FaceSwapper:
 
         # 执行换脸
         result = self._swapper.get(target_img, target_face, source_face)
+
+        # 颜色迁移: 让换脸区域的肤色/亮度匹配目标环境
+        if color_match:
+            try:
+                # 用人脸关键点生成 mask，仅对脸部区域做颜色迁移
+                landmarks = getattr(target_face, 'landmarks_2d', None)
+                mask = np.zeros(target_img.shape[:2], dtype=np.uint8)
+                if landmarks is not None:
+                    hull = cv2.convexHull(landmarks.astype(np.int32))
+                    cv2.fillConvexPoly(mask, hull, 255)
+                else:
+                    bbox = target_face.bbox.astype(np.int32).flatten()
+                    x1, y1, x2, y2 = bbox[:4]
+                    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                    axes = ((x2 - x1) // 2, (y2 - y1) // 2)
+                    cv2.ellipse(mask, (cx, cy), axes, 0, 0, 360, 255, -1)
+
+                # 模糊 mask 使过渡更自然
+                mask = cv2.GaussianBlur(mask, (31, 31), 15)
+
+                result = color_transfer(result, target_img, mask=mask)
+                logger.info("颜色迁移完成")
+            except Exception as e:
+                logger.warning(f"颜色迁移失败，跳过: {e}")
 
         # 可选: 无缝融合 (减少边界伪影)
         if blend:
@@ -301,7 +346,7 @@ class FaceSwapper:
         original_img: np.ndarray,
         face: Any,
     ) -> np.ndarray:
-        """用无缝融合改善人像边界"""
+        """用 Poisson Blending 改善人像边界"""
         try:
             bbox = face.bbox.astype(np.int32).flatten()
             x1, y1, x2, y2 = bbox[:4]
@@ -318,39 +363,59 @@ class FaceSwapper:
             roi_src = swapped_img[y1:y2, x1:x2]
             roi_dst = original_img[y1:y2, x1:x2]
 
-            # 创建遮罩
+            # 创建遮罩 (二值，Poisson 需要硬边界)
             mask = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
-            # 在遮罩中绘制面部区域
             landmarks = getattr(face, 'landmarks_2d', None)
             if landmarks is not None:
                 landmarks = landmarks.astype(np.int32)
             if landmarks is not None and len(landmarks) >= 5:
-                # 用关键点创建凸包
                 hull = cv2.convexHull(landmarks)
                 cv2.fillConvexPoly(mask, hull, 255)
             else:
-                # 用 bbox 中心椭圆
                 cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
                 axes = ((x2 - x1) // 2, (y2 - y1) // 2)
                 cv2.ellipse(mask, (cx - x1, cy - y1), axes, 0, 0, 360, 255, -1)
 
-            # 高斯模糊遮罩以实现柔和过渡
-            mask = cv2.GaussianBlur(mask, (21, 21), 11)
+            # 腐蚀遮罩边缘，避免 Poisson 克隆边界包含背景纹理
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            mask = cv2.erode(mask, kernel, iterations=1)
 
-            # 加权混合
-            mask_3ch = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR).astype(np.float32) / 255.0
-            blended_roi = (
-                roi_src.astype(np.float32) * mask_3ch
-                + roi_dst.astype(np.float32) * (1.0 - mask_3ch)
-            ).astype(np.uint8)
+            # Poisson Blending (梯度域融合)
+            center = ((x2 - x1) // 2, (y2 - y1) // 2)
+            blended = cv2.seamlessClone(
+                roi_src, roi_dst, mask, center, cv2.NORMAL_CLONE
+            )
 
             result = swapped_img.copy()
-            result[y1:y2, x1:x2] = blended_roi
+            result[y1:y2, x1:x2] = blended
             return result
 
         except Exception as e:
-            logger.warning(f"混合失败，返回原始换脸结果: {e}")
-            return swapped_img
+            logger.warning(f"Poisson 混合失败，回退到加权混合: {e}")
+            # 回退: 简单加权混合
+            try:
+                mask = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
+                landmarks = getattr(face, 'landmarks_2d', None)
+                if landmarks is not None:
+                    landmarks = landmarks.astype(np.int32)
+                if landmarks is not None and len(landmarks) >= 5:
+                    hull = cv2.convexHull(landmarks)
+                    cv2.fillConvexPoly(mask, hull, 255)
+                else:
+                    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                    axes = ((x2 - x1) // 2, (y2 - y1) // 2)
+                    cv2.ellipse(mask, (cx - x1, cy - y1), axes, 0, 0, 360, 255, -1)
+                mask = cv2.GaussianBlur(mask, (21, 21), 11)
+                mask_3ch = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR).astype(np.float32) / 255.0
+                blended = (
+                    roi_src.astype(np.float32) * mask_3ch
+                    + roi_dst.astype(np.float32) * (1.0 - mask_3ch)
+                ).astype(np.uint8)
+                result = swapped_img.copy()
+                result[y1:y2, x1:x2] = blended
+                return result
+            except Exception:
+                return swapped_img
 
     def enhance(
         self,

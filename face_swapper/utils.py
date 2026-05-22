@@ -86,6 +86,60 @@ def save_image(path: str, img: np.ndarray) -> bool:
         return False
 
 
+def color_transfer(
+    source: np.ndarray,
+    target: np.ndarray,
+    mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """颜色迁移 — 将 source 的配色风格转移到 target
+
+    基于 Reinhard et al. 2001 的 LAB 空间颜色迁移算法。
+    通过匹配 LAB 三个通道的均值和标准差，使 source 的色调/饱和度/亮度拟合 target。
+
+    Args:
+        source: 源图像 (BGR)，其颜色将被修改
+        target: 目标图像 (BGR)，提供参考颜色统计
+        mask: 可选 — 仅对 mask 区域计算统计 (灰度图, 0-255)
+
+    Returns:
+        颜色迁移后的 BGR 图像 (仅 source 区域被修改)
+    """
+    src_lab = cv2.cvtColor(source, cv2.COLOR_BGR2LAB).astype(np.float32)
+    tgt_lab = cv2.cvtColor(target, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    result = src_lab.copy()
+
+    for c in range(3):
+        if mask is not None:
+            # 仅在 mask 区域计算统计
+            mask_f = mask.astype(np.float32) / 255.0
+            src_mean = np.sum(src_lab[..., c] * mask_f) / (np.sum(mask_f) + 1e-6)
+            src_std = np.sqrt(
+                np.sum(mask_f * (src_lab[..., c] - src_mean) ** 2) / (np.sum(mask_f) + 1e-6)
+            )
+            tgt_mean = np.sum(tgt_lab[..., c] * mask_f) / (np.sum(mask_f) + 1e-6)
+            tgt_std = np.sqrt(
+                np.sum(mask_f * (tgt_lab[..., c] - tgt_mean) ** 2) / (np.sum(mask_f) + 1e-6)
+            )
+        else:
+            src_mean, src_std = src_lab[..., c].mean(), src_lab[..., c].std()
+            tgt_mean, tgt_std = tgt_lab[..., c].mean(), tgt_lab[..., c].std()
+
+        # 标准化: (src - src_mean) / src_std * tgt_std + tgt_mean
+        result[..., c] = (src_lab[..., c] - src_mean) * (tgt_std / (src_std + 1e-6)) + tgt_mean
+
+    result = np.clip(result, 0, 255).astype(np.uint8)
+    result_bgr = cv2.cvtColor(result, cv2.COLOR_LAB2BGR)
+
+    # 仅修改源图中有 mask 的区域 (保留背景)
+    if mask is not None:
+        mask_3ch = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR).astype(np.float32) / 255.0
+        output = (source.astype(np.float32) * (1 - mask_3ch) + result_bgr.astype(np.float32) * mask_3ch)
+        return np.clip(output, 0, 255).astype(np.uint8)
+
+    return result_bgr
+
+
 def blend_images(
     foreground: np.ndarray,
     background: np.ndarray,

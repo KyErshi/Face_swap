@@ -47,6 +47,8 @@ class VideoProcessor:
         target_face_idx: int = 0,
         enhance: bool = False,
         blend: bool = True,
+        color_match: bool = True,
+        temporal_smooth: bool = True,
         max_frames: int = 0,  # 0 = 全部帧
         start_frame: int = 0,
         end_frame: int = 0,  # 0 = 到结束
@@ -145,6 +147,9 @@ class VideoProcessor:
                 unit="帧",
             )
 
+            # 时域平滑状态
+            prev_face_bbox: Optional[np.ndarray] = None  # (cx, cy, w, h)
+
             while frame_idx < end_frame:
                 ret, frame = cap.read()
                 if not ret:
@@ -156,8 +161,30 @@ class VideoProcessor:
                     target_faces = self.swapper.detect_faces(frame)
 
                     if len(target_faces) > 0:
-                        # 处理所有检测到的人脸或指定的人脸
-                        tgt_idx = min(target_face_idx, len(target_faces) - 1)
+                        # 时域追踪: 选择最接近上一帧的人脸 (避免编号漂移)
+                        if temporal_smooth and prev_face_bbox is not None:
+                            prev_cx, prev_cy = prev_face_bbox[:2]
+                            best_idx = 0
+                            best_dist = float("inf")
+                            for i, f in enumerate(target_faces):
+                                b = f.bbox.astype(np.int32).flatten()
+                                cx = (b[0] + b[2]) // 2
+                                cy = (b[1] + b[3]) // 2
+                                dist = (cx - prev_cx) ** 2 + (cy - prev_cy) ** 2
+                                if dist < best_dist:
+                                    best_dist = dist
+                                    best_idx = i
+                            tgt_idx = best_idx
+                        else:
+                            tgt_idx = min(target_face_idx, len(target_faces) - 1)
+
+                        # 记录当前帧的人脸位置用于下一帧追踪
+                        if temporal_smooth:
+                            b = target_faces[tgt_idx].bbox.astype(np.int32).flatten()
+                            cx = (b[0] + b[2]) // 2
+                            cy = (b[1] + b[3]) // 2
+                            prev_face_bbox = np.array([cx, cy, b[2] - b[0], b[3] - b[1]])
+
                         result = self.swapper._swapper.get(
                             frame, target_faces[tgt_idx], source_face
                         )
@@ -166,6 +193,20 @@ class VideoProcessor:
                             result = self.swapper._blend_face(
                                 result, frame, target_faces[tgt_idx]
                             )
+
+                        if color_match:
+                            try:
+                                from .utils import color_transfer
+                                face = target_faces[tgt_idx]
+                                lmk = getattr(face, 'landmarks_2d', None)
+                                if lmk is not None:
+                                    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+                                    hull = cv2.convexHull(lmk.astype(np.int32))
+                                    cv2.fillConvexPoly(mask, hull, 255)
+                                    mask = cv2.GaussianBlur(mask, (31, 31), 15)
+                                    result = color_transfer(result, frame, mask=mask)
+                            except Exception as e:
+                                logger.warning(f"帧 {frame_idx} 颜色迁移失败: {e}")
 
                         if enhance:
                             result = self.swapper.enhance(result)

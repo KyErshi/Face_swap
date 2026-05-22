@@ -54,6 +54,13 @@ def get_engine_instance() -> FaceSwapper:
     return _engine
 
 
+def update_det_threshold(threshold: float):
+    """更新全局引擎的人脸检测阈值"""
+    engine = get_engine_instance()
+    engine.set_det_threshold(threshold)
+    return f"✅ 检测阈值已设为 {threshold:.2f}"
+
+
 def parse_face_idx(selector_value: str | int) -> int:
     """从 Gradio 下拉菜单值解析人脸索引"""
     if isinstance(selector_value, int):
@@ -77,6 +84,7 @@ def image_swap(
     target_face_idx: str | int,
     enable_enhance: bool,
     enable_blend: bool,
+    enable_color_match: bool,
     progress: gr.Progress = gr.Progress(),
 ) -> Tuple[np.ndarray, str, str]:
     """图片换脸主函数"""
@@ -104,6 +112,7 @@ def image_swap(
             target_face_idx=tgt_idx,
             enhance=enable_enhance,
             blend=enable_blend,
+            color_match=enable_color_match,
         )
     except ValueError as e:
         raise gr.Error(str(e))
@@ -173,6 +182,8 @@ def video_swap(
     source_face_idx: str | int,
     enable_enhance: bool,
     enable_blend: bool,
+    enable_color_match: bool,
+    enable_temporal_smooth: bool,
     keep_audio: bool,
     process_seconds: int,
     progress: gr.Progress = gr.Progress(),
@@ -243,6 +254,8 @@ def video_swap(
             target_face_idx=0,
             enhance=enable_enhance,
             blend=enable_blend,
+            color_match=enable_color_match,
+            temporal_smooth=enable_temporal_smooth,
             max_frames=max_frames,
             keep_audio=keep_audio,
         )
@@ -334,6 +347,28 @@ def build_app() -> gr.Blocks:
                             label="无缝融合 (减少边界)",
                             value=True,
                         )
+                        enable_color_match = gr.Checkbox(
+                            label="颜色匹配 (消除肤色色差)",
+                            value=True,
+                        )
+                    det_threshold_slider = gr.Slider(
+                        minimum=0.1,
+                        maximum=0.9,
+                        value=0.5,
+                        step=0.05,
+                        label="人脸检测灵敏度 (越低越灵敏)",
+                    )
+                    det_threshold_status = gr.Markdown("")
+                    det_threshold_slider.change(
+                        fn=update_det_threshold,
+                        inputs=[det_threshold_slider],
+                        outputs=[det_threshold_status],
+                    )
+                    det_threshold_slider.release(
+                        fn=update_det_threshold,
+                        inputs=[det_threshold_slider],
+                        outputs=[det_threshold_status],
+                    )
 
                 swap_btn = gr.Button(
                     "✨ 开始换脸",
@@ -413,6 +448,7 @@ def build_app() -> gr.Blocks:
                         tgt_face_selector,
                         enable_enhance,
                         enable_blend,
+                        enable_color_match,
                     ],
                     outputs=[output_img, status_msg],
                 )
@@ -450,6 +486,12 @@ def build_app() -> gr.Blocks:
                         )
                         v_blend = gr.Checkbox(
                             label="无缝融合", value=True
+                        )
+                        v_color_match = gr.Checkbox(
+                            label="颜色匹配", value=True
+                        )
+                        v_temporal_smooth = gr.Checkbox(
+                            label="时域平滑 (减少闪烁)", value=True
                         )
                     v_process_seconds = gr.Slider(
                         minimum=0,
@@ -500,6 +542,8 @@ def build_app() -> gr.Blocks:
                         v_src_face_selector,
                         v_enhance,
                         v_blend,
+                        v_color_match,
+                        v_temporal_smooth,
                         v_keep_audio,
                         v_process_seconds,
                     ],
