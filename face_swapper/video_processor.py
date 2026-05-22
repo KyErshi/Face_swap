@@ -7,7 +7,7 @@ import os
 import logging
 import tempfile
 from pathlib import Path
-from typing import Optional, Callable, Union
+from typing import Optional, Callable, Union, Any
 
 import cv2
 import numpy as np
@@ -195,15 +195,17 @@ class VideoProcessor:
             cap.release()
             logger.info(f"视频换脸完成: 处理 {processed} 帧")
 
-            # 合并音频
+            # 合并音频 & 重新编码为浏览器兼容格式
             if keep_audio:
                 output_path = self._merge_audio(video_path, temp_video, output_path)
             else:
-                # 直接移动
+                # 无声版 — 同样用 ffmpeg 重编码确保可播放
                 self._ensure_output_dir(output_path)
-                if os.path.exists(output_path):
-                    os.remove(output_path)
-                os.rename(temp_video, output_path)
+                if not self._reencode_video(temp_video, output_path, audio_video=None):
+                    # ffmpeg 失败，直接移动原始文件
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+                    os.rename(temp_video, output_path)
 
             return output_path
 
@@ -219,68 +221,84 @@ class VideoProcessor:
                 except OSError:
                     pass
 
+    def _reencode_video(
+        self,
+        input_video: str,
+        output_video: str,
+        audio_video: Optional[str] = None,
+    ) -> bool:
+        """用 ffmpeg 将视频重新编码为浏览器兼容的 H.264 MP4
+
+        Args:
+            input_video: 源视频路径 (OpenCV 生成)
+            output_video: 输出路径
+            audio_video: 可选 — 从此文件中提取音频流
+
+        Returns:
+            是否成功
+        """
+        import subprocess
+
+        cmd = [
+            "ffmpeg",
+            "-i", input_video,
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-pix_fmt", "yuv420p",        # 浏览器兼容的色彩格式
+            "-movflags", "+faststart",     # moov 放前面，支持流式播放
+            "-crf", "18",                  # 高质量 (0-51, 越小越好)
+        ]
+
+        if audio_video and os.path.exists(audio_video):
+            cmd.extend(["-i", audio_video])
+            cmd.extend(["-c:a", "aac", "-map", "0:v:0", "-map", "1:a:0", "-shortest"])
+        else:
+            cmd.extend(["-an"])  # 无音频
+
+        cmd.extend(["-y", output_video])
+
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=600,
+            )
+            if result.returncode == 0:
+                logger.info(f"ffmpeg 重新编码完成: {output_video}")
+                return True
+            else:
+                logger.error(f"ffmpeg 失败:\n{result.stderr}")
+                return False
+        except Exception as e:
+            logger.error(f"ffmpeg 异常: {e}")
+            return False
+
     def _merge_audio(
         self,
         input_video: str,
         temp_video: str,
         output_video: str,
     ) -> str:
-        """使用 ffmpeg 合并视频和音频"""
+        """重新编码并合并音频为浏览器可播放的 MP4"""
         self._ensure_output_dir(output_video)
 
-        # 先尝试用 ffmpeg-python
-        try:
-            import ffmpeg
-
-            input_video_obj = ffmpeg.input(temp_video)
-            input_audio_obj = ffmpeg.input(input_video)
-
-            # 音频流从原视频，视频流从换脸结果
-            stream = ffmpeg.output(
-                input_video_obj["v"],
-                input_audio_obj["a"],
-                output_video,
-                vcodec="libx264",
-                acodec="aac",
-                preset="fast",
-                **{"b:v": "8M"},
-                loglevel="quiet",
-            )
-            stream.run(overwrite_output=True, capture_stdout=True, capture_stderr=True)
-
-            logger.info(f"音频合并完成: {output_video}")
+        # 尝试带音频的重新编码
+        if self._reencode_video(temp_video, output_video, audio_video=input_video):
             return output_video
 
-        except Exception as e:
-            logger.warning(f"ffmpeg-python 合并失败: {e}，尝试直接调用 ffmpeg...")
-
-        # 回退: 直接调用 ffmpeg 命令行
-        try:
-            import subprocess
-
-            cmd = [
-                "ffmpeg",
-                "-i", temp_video,
-                "-i", input_video,
-                "-c:v", "libx264",
-                "-c:a", "aac",
-                "-map", "0:v:0",
-                "-map", "1:a:0",
-                "-shortest",
-                "-y",
-                output_video,
-            ]
-            subprocess.run(cmd, capture_output=True, timeout=300)
-            logger.info(f"音频合并完成: {output_video}")
-            return output_video
-
-        except Exception as e:
-            logger.warning(f"ffmpeg 不可用, 返回无音频视频: {e}")
-            # 无法合并音频，返回无声视频
+        # 回退 1: 无声版本
+        no_audio_out = output_video.replace(".mp4", "_no_audio.mp4")
+        if self._reencode_video(temp_video, no_audio_out, audio_video=None):
+            # 复制回最终路径
             if os.path.exists(output_video):
                 os.remove(output_video)
-            os.rename(temp_video, output_video)
+            os.rename(no_audio_out, output_video)
             return output_video
+
+        # 回退 2: 直接使用 OpenCV 原片
+        logger.warning("ffmpeg 全部失败，返回 OpenCV 原始视频 (部分浏览器可能无法播放)")
+        if os.path.exists(output_video):
+            os.remove(output_video)
+        os.rename(temp_video, output_video)
+        return output_video
 
     @staticmethod
     def _ensure_output_dir(path: str):
