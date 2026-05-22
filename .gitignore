@@ -19,3 +19,5 @@ Thumbs.db
 # 环境
 .venv/
 venv/
+gfpgan/
+git_askpass.bat
