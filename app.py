@@ -183,6 +183,7 @@ def video_swap(
     target_video: Optional[str],
     source_face_idx: str | int,
     enable_enhance: bool,
+    enable_enhance_source: bool,
     enable_blend: bool,
     enable_color_match: bool,
     enable_temporal_smooth: bool,
@@ -255,6 +256,7 @@ def video_swap(
             source_face_idx=src_idx,
             target_face_idx=0,
             enhance=enable_enhance,
+            enhance_source=enable_enhance_source,
             blend=enable_blend,
             color_match=enable_color_match,
             temporal_smooth=enable_temporal_smooth,
@@ -500,6 +502,9 @@ def build_app() -> gr.Blocks:
                         v_temporal_smooth = gr.Checkbox(
                             label="时域平滑 (减少闪烁)", value=True
                         )
+                        v_enhance_source = gr.Checkbox(
+                            label="源人脸增强", value=True
+                        )
                     v_process_seconds = gr.Slider(
                         minimum=0,
                         maximum=120,
@@ -548,6 +553,7 @@ def build_app() -> gr.Blocks:
                         v_tgt_video,
                         v_src_face_selector,
                         v_enhance,
+                        v_enhance_source,
                         v_blend,
                         v_color_match,
                         v_temporal_smooth,

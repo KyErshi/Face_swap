@@ -46,6 +46,7 @@ class VideoProcessor:
         source_face_idx: int = 0,
         target_face_idx: int = 0,
         enhance: bool = False,
+        enhance_source: bool = True,
         blend: bool = True,
         color_match: bool = True,
         temporal_smooth: bool = True,
@@ -83,6 +84,23 @@ class VideoProcessor:
                 f"源图第 {source_face_idx} 张人脸不存在 (共 {len(source_faces)} 张)"
             )
         source_face = source_faces[source_face_idx]
+
+        # 源人脸预增强: 用 GFPGAN 提升源图质量后再提取特征
+        if enhance_source:
+            try:
+                from .enhancer import FaceEnhancer
+                from .utils import crop_face
+                enhancer = FaceEnhancer()
+                src_face_crop = crop_face(source_img, source_face)
+                if src_face_crop is not None and src_face_crop.size > 0:
+                    enhanced_crop = enhancer.enhance(src_face_crop)
+                    enhanced_faces = self.swapper.detect_faces(enhanced_crop, retry_lower_threshold=False)
+                    if len(enhanced_faces) > 0:
+                        best = max(enhanced_faces, key=lambda f: f.det_score if hasattr(f, 'det_score') else 1.0)
+                        source_face = best
+                        logger.info("视频源人脸预增强完成")
+            except Exception as e:
+                logger.warning(f"视频源人脸预增强失败，使用原始特征: {e}")
 
         # 打开视频
         cap = cv2.VideoCapture(video_path)
