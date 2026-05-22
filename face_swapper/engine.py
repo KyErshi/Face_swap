@@ -321,8 +321,10 @@ class FaceSwapper:
             # 创建遮罩
             mask = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
             # 在遮罩中绘制面部区域
-            landmarks = face.landmarks_2d.astype(np.int32)
-            if len(landmarks) >= 5:
+            landmarks = getattr(face, 'landmarks_2d', None)
+            if landmarks is not None:
+                landmarks = landmarks.astype(np.int32)
+            if landmarks is not None and len(landmarks) >= 5:
                 # 用关键点创建凸包
                 hull = cv2.convexHull(landmarks)
                 cv2.fillConvexPoly(mask, hull, 255)

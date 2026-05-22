@@ -244,21 +244,26 @@ class VideoProcessor:
         """
         import subprocess
 
-        cmd = [
-            "ffmpeg",
-            "-i", input_video,
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-pix_fmt", "yuv420p",        # 浏览器兼容的色彩格式
-            "-movflags", "+faststart",     # moov 放前面，支持流式播放
-            "-crf", "18",                  # 高质量 (0-51, 越小越好)
-        ]
+        # 所有输入放前面，输出选项放后面
+        # 注意: -c:v 等编码选项必须在所有 -i 之后，否则 ffmpeg 会误用为解码器
+        cmd = ["ffmpeg", "-i", input_video]
 
         if audio_video and os.path.exists(audio_video):
             cmd.extend(["-i", audio_video])
+
+        # 输出选项
+        cmd.extend([
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-crf", "18",
+        ])
+
+        if audio_video and os.path.exists(audio_video):
             cmd.extend(["-c:a", "aac", "-map", "0:v:0", "-map", "1:a:0", "-shortest"])
         else:
-            cmd.extend(["-an"])  # 无音频
+            cmd.extend(["-an"])
 
         cmd.extend(["-y", output_video])
 
