@@ -83,6 +83,7 @@ def image_swap(
     source_face_idx: str | int,
     target_face_idx: str | int,
     enable_enhance: bool,
+    enable_enhance_source: bool,
     enable_blend: bool,
     enable_color_match: bool,
     progress: gr.Progress = gr.Progress(),
@@ -111,6 +112,7 @@ def image_swap(
             source_face_idx=src_idx,
             target_face_idx=tgt_idx,
             enhance=enable_enhance,
+            enhance_source=enable_enhance_source,
             blend=enable_blend,
             color_match=enable_color_match,
         )
@@ -343,6 +345,10 @@ def build_app() -> gr.Blocks:
                             label="GFPGAN 增强 (提高清晰度)",
                             value=False,
                         )
+                        enable_enhance_source = gr.Checkbox(
+                            label="源人脸增强 (提高相似度)",
+                            value=True,
+                        )
                         enable_blend = gr.Checkbox(
                             label="无缝融合 (减少边界)",
                             value=True,
@@ -447,6 +453,7 @@ def build_app() -> gr.Blocks:
                         src_face_selector,
                         tgt_face_selector,
                         enable_enhance,
+                        enable_enhance_source,
                         enable_blend,
                         enable_color_match,
                     ],

@@ -191,11 +191,16 @@ class FaceSwapper:
             except Exception as e:
                 logger.warning(f"更新检测阈值失败: {e}")
 
-    def detect_faces(self, img: np.ndarray) -> List[Any]:
+    def detect_faces(
+        self,
+        img: np.ndarray,
+        retry_lower_threshold: bool = True,
+    ) -> List[Any]:
         """检测图像中所有人脸
 
         Args:
             img: BGR 图像 (OpenCV 格式)
+            retry_lower_threshold: 未检测到时是否自动降低阈值重试
 
         Returns:
             人脸对象列表，每个包含 bbox/landmarks/embedding/age/gender
@@ -208,6 +213,40 @@ class FaceSwapper:
         # 确保 RGB 格式 (insightface 使用 RGB)
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         faces = self._face_analysis.get(img_rgb)
+
+        # 自动降阈值重试 (解决侧脸/低光照检测不到的问题)
+        if len(faces) == 0 and retry_lower_threshold and self.det_threshold > 0.1:
+            original_thresh = self.det_threshold
+            for trial_thresh in [0.3, 0.1, 0.05]:
+                if trial_thresh >= original_thresh:
+                    continue
+                logger.info(
+                    f"未检测到人脸，降阈值到 {trial_thresh:.2f} 重试..."
+                )
+                self.set_det_threshold(trial_thresh)
+                faces = self._face_analysis.get(img_rgb)
+                if len(faces) > 0:
+                    logger.info(f"降阈值后检测到 {len(faces)} 张人脸")
+                    # 恢复原阈值 (供后续调用使用)
+                    if trial_thresh != original_thresh:
+                        self.set_det_threshold(original_thresh)
+                    return faces
+
+            # 所有阈值都试完仍未检测到，尝试 CLAHE 增强对比度后再试
+            if len(faces) == 0:
+                logger.info("尝试 CLAHE 增强对比度后重试...")
+                lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+                l, a, b = cv2.split(lab)
+                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                l = clahe.apply(l)
+                enhanced = cv2.merge([l, a, b])
+                enhanced_bgr = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+                enhanced_rgb = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2RGB)
+                faces = self._face_analysis.get(enhanced_rgb)
+
+            # 恢复原阈值
+            self.set_det_threshold(original_thresh)
+
         logger.debug(f"检测到 {len(faces)} 张人脸")
         return faces
 
@@ -218,6 +257,7 @@ class FaceSwapper:
         source_face_idx: int = 0,
         target_face_idx: int = 0,
         enhance: bool = False,
+        enhance_source: bool = True,
         blend: bool = True,
         color_match: bool = True,
     ) -> np.ndarray:
@@ -228,7 +268,8 @@ class FaceSwapper:
             target_img: 目标图像 (BGR) — 被换脸的对象
             source_face_idx: 源图中第几张人脸 (默认第一张)
             target_face_idx: 目标图中第几张人脸 (默认第一张)
-            enhance: 是否进行 GFPGAN 增强
+            enhance: 是否进行 GFPGAN 增强 (目标结果)
+            enhance_source: 是否对源人脸做 GFPGAN 增强后再提取特征 (提高相似度)
             blend: 是否使用无缝融合
             color_match: 是否进行颜色迁移，使肤色匹配目标环境
 
@@ -257,6 +298,27 @@ class FaceSwapper:
 
         source_face = source_faces[source_face_idx]
         target_face = target_faces[target_face_idx]
+
+        # 源人脸预增强: 用 GFPGAN 提升源图质量后再提取特征
+        if enhance_source:
+            try:
+                from .enhancer import FaceEnhancer
+                if self._enhancer is None:
+                    self._enhancer = FaceEnhancer()
+                # 提取源人脸区域
+                from .utils import crop_face
+                src_face_crop = crop_face(source_img, source_face)
+                if src_face_crop is not None and src_face_crop.size > 0:
+                    enhanced_crop = self._enhancer.enhance(src_face_crop)
+                    # 用增强后的源图重新检测 + 提取特征
+                    enhanced_faces = self.detect_faces(enhanced_crop, retry_lower_threshold=False)
+                    if len(enhanced_faces) > 0:
+                        # 取置信度最高的人脸
+                        best = max(enhanced_faces, key=lambda f: f.det_score if hasattr(f, 'det_score') else 1.0)
+                        source_face = best
+                        logger.info("源人脸预增强完成，重新提取特征")
+            except Exception as e:
+                logger.warning(f"源人脸预增强失败，使用原始特征: {e}")
 
         logger.info(
             f"执行换脸: 源={source_face_idx} "
