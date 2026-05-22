@@ -107,27 +107,27 @@ class VideoProcessor:
         temp_video = os.path.join(
             self.temp_dir, f"temp_swapped_{os.getpid()}.mp4"
         )
+        temp_video_avi = temp_video.replace(".mp4", ".avi")
 
         try:
-            # 视频写入器
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            # 写入 AVI 格式 (OpenCV 对 AVI 支持最稳定)
+            fourcc = cv2.VideoWriter_fourcc(*"XVID")
             writer = cv2.VideoWriter(
-                temp_video,
+                temp_video_avi,
                 fourcc,
                 actual_fps,
                 (width, height),
             )
 
             if not writer.isOpened():
-                # 回退到 avi
-                temp_video = temp_video.replace(".mp4", ".avi")
-                fourcc = cv2.VideoWriter_fourcc(*"XVID")
+                # 回退: 直接写入 mp4
                 writer = cv2.VideoWriter(
                     temp_video,
-                    fourcc,
+                    cv2.VideoWriter_fourcc(*"mp4v"),
                     actual_fps,
                     (width, height),
                 )
+                temp_video_avi = temp_video  # 不使用 avi 路径
 
             # 跳到起始帧
             if start_frame > 0:
@@ -195,17 +195,21 @@ class VideoProcessor:
             cap.release()
             logger.info(f"视频换脸完成: 处理 {processed} 帧")
 
-            # 合并音频 & 重新编码为浏览器兼容格式
+            # 始终通过 ffmpeg 转为浏览器兼容的 MP4
+            self._ensure_output_dir(output_path)
+            source_for_ffmpeg = temp_video_avi if os.path.exists(temp_video_avi) else temp_video
+
             if keep_audio:
-                output_path = self._merge_audio(video_path, temp_video, output_path)
+                success = self._reencode_video(source_for_ffmpeg, output_path, audio_video=video_path)
             else:
-                # 无声版 — 同样用 ffmpeg 重编码确保可播放
-                self._ensure_output_dir(output_path)
-                if not self._reencode_video(temp_video, output_path, audio_video=None):
-                    # ffmpeg 失败，直接移动原始文件
-                    if os.path.exists(output_path):
-                        os.remove(output_path)
-                    os.rename(temp_video, output_path)
+                success = self._reencode_video(source_for_ffmpeg, output_path, audio_video=None)
+
+            if not success:
+                logger.error("ffmpeg 全部失败，尝试返回原始文件")
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+                if os.path.exists(source_for_ffmpeg):
+                    os.rename(source_for_ffmpeg, output_path)
 
             return output_path
 
@@ -213,13 +217,14 @@ class VideoProcessor:
             logger.error(f"视频处理失败: {e}")
             raise
         finally:
-            # 清理临时文件
             cap.release()
-            if os.path.exists(temp_video) and temp_video != output_path:
-                try:
-                    os.remove(temp_video)
-                except OSError:
-                    pass
+            # 清理临时文件
+            for tmp in [temp_video, temp_video_avi]:
+                if os.path.exists(tmp) and tmp != output_path:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
 
     def _reencode_video(
         self,
