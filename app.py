@@ -86,7 +86,6 @@ def image_swap(
     enable_enhance_source: bool,
     enable_blend: bool,
     enable_color_match: bool,
-    enable_preserve_eyes: bool,
     enable_skin_texture: bool,
     progress: gr.Progress = gr.Progress(),
 ) -> Tuple[np.ndarray, str, str]:
@@ -117,7 +116,6 @@ def image_swap(
             enhance_source=enable_enhance_source,
             blend=enable_blend,
             color_match=enable_color_match,
-            preserve_eyes=enable_preserve_eyes,
             skin_texture=enable_skin_texture,
         )
     except ValueError as e:
@@ -190,7 +188,6 @@ def video_swap(
     enable_enhance_source: bool,
     enable_blend: bool,
     enable_color_match: bool,
-    enable_preserve_eyes: bool,
     enable_skin_texture: bool,
     enable_temporal_smooth: bool,
     keep_audio: bool,
@@ -265,7 +262,6 @@ def video_swap(
             enhance_source=enable_enhance_source,
             blend=enable_blend,
             color_match=enable_color_match,
-            preserve_eyes=enable_preserve_eyes,
             skin_texture=enable_skin_texture,
             temporal_smooth=enable_temporal_smooth,
             max_frames=max_frames,
@@ -366,9 +362,6 @@ def build_app() -> gr.Blocks:
                         enable_color_match = gr.Checkbox(
                             label="颜色匹配 (消除肤色色差)",
                             value=True,
-                        )
-                        enable_preserve_eyes = gr.Checkbox(
-                            label="保留眼形", value=True
                         )
                         enable_skin_texture = gr.Checkbox(
                             label="皮肤纹理", value=True
@@ -472,7 +465,6 @@ def build_app() -> gr.Blocks:
                         enable_enhance_source,
                         enable_blend,
                         enable_color_match,
-                        enable_preserve_eyes,
                         enable_skin_texture,
                     ],
                     outputs=[output_img, status_msg],
@@ -520,9 +512,6 @@ def build_app() -> gr.Blocks:
                         )
                         v_enhance_source = gr.Checkbox(
                             label="源人脸增强", value=True
-                        )
-                        v_preserve_eyes = gr.Checkbox(
-                            label="保留眼形", value=True
                         )
                         v_skin_texture = gr.Checkbox(
                             label="皮肤纹理", value=True
@@ -578,7 +567,6 @@ def build_app() -> gr.Blocks:
                         v_enhance_source,
                         v_blend,
                         v_color_match,
-                        v_preserve_eyes,
                         v_skin_texture,
                         v_temporal_smooth,
                         v_keep_audio,

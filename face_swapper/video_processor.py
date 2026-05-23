@@ -49,8 +49,7 @@ class VideoProcessor:
         enhance_source: bool = True,
         blend: bool = True,
         color_match: bool = True,
-        preserve_eyes: bool = True,
-        skin_texture: bool = True,
+        skin_texture: bool = False,
         temporal_smooth: bool = True,
         max_frames: int = 0,  # 0 = 全部帧
         start_frame: int = 0,
@@ -87,13 +86,41 @@ class VideoProcessor:
             )
         source_face = source_faces[source_face_idx]
 
-        # 源人脸预增强: 用 GFPGAN 提升源图质量后再提取特征
+        # 源人脸预增强: 眼部 CLAHE + GFPGAN 后再提取特征
         if enhance_source:
             try:
+                # --- 1. 眼部 CLAHE 增强 ---
+                src_img_enhanced = source_img.copy()
+                src_lmk = self.swapper._get_landmarks(source_face)
+                if src_lmk is not None and len(src_lmk) >= 2:
+                    src_eyes = src_lmk[:2].astype(np.int32)
+                    eye_dist = float(np.linalg.norm(
+                        src_eyes[0].astype(float) - src_eyes[1].astype(float)
+                    ))
+                    eye_r = max(int(eye_dist * 0.25), 12)
+                    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+                    for ex, ey in src_eyes:
+                        x1 = max(0, ex - eye_r)
+                        y1 = max(0, ey - eye_r)
+                        x2 = min(source_img.shape[1], ex + eye_r)
+                        y2 = min(source_img.shape[0], ey + eye_r)
+                        roi = src_img_enhanced[y1:y2, x1:x2]
+                        if roi.size > 0:
+                            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                            enhanced_gray = clahe.apply(gray)
+                            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV).astype(float)
+                            hsv[..., 2] = hsv[..., 2] * 0.5 + enhanced_gray.astype(float) * 0.5
+                            src_img_enhanced[y1:y2, x1:x2] = cv2.cvtColor(
+                                hsv.clip(0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR
+                            )
+                    logger.info("视频源人脸眼部 CLAHE 增强完成")
+
+                # --- 2. GFPGAN 增强全脸 ---
                 from .enhancer import FaceEnhancer
                 from .utils import crop_face
                 enhancer = FaceEnhancer()
-                src_face_crop = crop_face(source_img, source_face)
+                bbox_arr = source_face.bbox.astype(np.int32).flatten()
+                src_face_crop = crop_face(src_img_enhanced, bbox_arr)
                 if src_face_crop is not None and src_face_crop.size > 0:
                     enhanced_crop = enhancer.enhance(src_face_crop)
                     enhanced_faces = self.swapper.detect_faces(enhanced_crop, retry_lower_threshold=False)
@@ -214,23 +241,16 @@ class VideoProcessor:
                                 result, frame, target_faces[tgt_idx]
                             )
 
-                        if preserve_eyes:
-                            try:
-                                result = self.swapper._preserve_eyes(
-                                    result, source_img, source_face,
-                                    target_faces[tgt_idx]
-                                )
-                            except Exception as e:
-                                logger.warning(f"帧 {frame_idx} 眼睛保留失败: {e}")
-
                         if skin_texture:
                             try:
                                 from .utils import transfer_skin_texture
                                 bbox = target_faces[tgt_idx].bbox.astype(np.int32).flatten()
+                                src_lmk = self.swapper._get_landmarks(source_face)
                                 result = transfer_skin_texture(
                                     result, source_img,
                                     source_face_roi=(bbox[0], bbox[1], bbox[2], bbox[3]),
-                                    strength=0.3, sigma=3.0,
+                                    strength=0.3, sigma=2.0,
+                                    landmarks=src_lmk,
                                 )
                             except Exception as e:
                                 logger.warning(f"帧 {frame_idx} 皮肤纹理失败: {e}")
@@ -239,7 +259,7 @@ class VideoProcessor:
                             try:
                                 from .utils import color_transfer
                                 face = target_faces[tgt_idx]
-                                lmk = getattr(face, 'landmarks_2d', None)
+                                lmk = self.swapper._get_landmarks(face)
                                 if lmk is not None:
                                     mask = np.zeros(frame.shape[:2], dtype=np.uint8)
                                     hull = cv2.convexHull(lmk.astype(np.int32))

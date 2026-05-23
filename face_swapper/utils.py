@@ -144,65 +144,127 @@ def transfer_skin_texture(
     result_img: np.ndarray,
     source_img: np.ndarray,
     source_face_roi: tuple,
-    strength: float = 0.4,
-    sigma: float = 3.0,
+    strength: float = 0.35,
+    sigma: float = 2.0,
+    landmarks: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """迁移源人脸皮肤纹理到换脸结果
 
-    通过高斯差分提取源图皮肤的高频纹理（毛孔、皮肤细节），
-    叠加到换脸结果中，消除"塑料感"。
+    只在 LAB 空间的 L 通道操作，确保不改变颜色。
+    高斯差分提取源图皮肤纹理，用局部对比度自适应调节强度，
+    并在皮肤区域使用柔和遮罩。
 
     Args:
         result_img: 换脸后的 BGR 图像
         source_img: 原始源 BGR 图像
-        source_face_roi: (x1, y1, x2, y2) 人脸框区域
-        strength: 纹理强度 0~1，默认 0.4
-        sigma: 高斯模糊 sigma，控制纹理尺度，默认 3.0
+        source_face_roi: (x1, y1, x2, y2) 人脸框
+        strength: 基础纹理强度
+        sigma: 高斯模糊 sigma (越小纹理越细，越大纹理越粗)
+        landmarks: 关键点 (用于排除眼/嘴区域), shape (N,2)
 
     Returns:
         叠加纹理后的 BGR 图像
     """
     try:
         x1, y1, x2, y2 = source_face_roi
-        h, w = source_img.shape[:2]
-        margin = int(max(x2 - x1, y2 - y1) * 0.15)
-        x1 = max(0, x1 - margin)
-        y1 = max(0, y1 - margin)
-        x2 = min(w, x2 + margin)
-        y2 = min(h, y2 + margin)
-        roi_h, roi_w = y2 - y1, x2 - x1
-        if roi_w <= 16 or roi_h <= 16:
+        rh, rw = result_img.shape[:2]
+        sh, sw = source_img.shape[:2]
+        margin = int(max(x2 - x1, y2 - y1) * 0.2)
+
+        # 各自按各自的尺寸裁切 (源图和结果图可能尺寸不同)
+        sx1 = max(0, x1 - margin)
+        sy1 = max(0, y1 - margin)
+        sx2 = min(sw, x2 + margin)
+        sy2 = min(sh, y2 + margin)
+        rx1 = max(0, x1 - margin)
+        ry1 = max(0, y1 - margin)
+        rx2 = min(rw, x2 + margin)
+        ry2 = min(rh, y2 + margin)
+        roi_h_r, roi_w_r = ry2 - ry1, rx2 - rx1
+        if roi_w_r <= 20 or roi_h_r <= 20:
             return result_img
 
-        src_roi = source_img[y1:y2, x1:x2].astype(np.float32)
-        res_roi = result_img[y1:y2, x1:x2].astype(np.float32)
-        if src_roi.shape != res_roi.shape:
-            src_roi = cv2.resize(src_roi, (roi_w, roi_h))
+        src_roi = source_img[sy1:sy2, sx1:sx2].astype(np.float32)
+        res_roi = result_img[ry1:ry2, rx1:rx2].astype(np.float32)
+        # 统一以结果图尺寸为准
+        if src_roi.shape[:2] != (roi_h_r, roi_w_r):
+            src_roi = cv2.resize(src_roi, (roi_w_r, roi_h_r),
+                                 interpolation=cv2.INTER_LANCZOS4)
 
-        # 高斯差分提取源图的高频细节 (纹理)
-        src_blur = cv2.GaussianBlur(src_roi, (0, 0), sigma)
-        texture = src_roi - src_blur  # 高频 = 毛孔、皮肤细节
+        # 转到 LAB 空间，只操作 L 通道
+        src_lab = cv2.cvtColor(src_roi.astype(np.uint8), cv2.COLOR_BGR2LAB).astype(float)
+        res_lab = cv2.cvtColor(res_roi.astype(np.uint8), cv2.COLOR_BGR2LAB).astype(float)
 
-        # 皮肤区域遮罩 (不覆盖眼睛、嘴、发际线边缘)
-        skin_mask = np.ones((roi_h, roi_w), dtype=np.float32) * 0.6
-        featheredge = 8
-        # 边缘淡出
-        cv2.rectangle(skin_mask, (0, 0), (roi_w, roi_h), 0.4, featheredge)
-        skin_mask[featheredge:-featheredge, featheredge:-featheredge] = 1.0
-        skin_mask = cv2.GaussianBlur(skin_mask, (15, 15), 7)
+        src_l = src_lab[..., 0]
+        res_l = res_lab[..., 0]
+
+        # 多尺度纹理提取 (细纹理 + 中等纹理)
+        blur1 = cv2.GaussianBlur(src_l, (0, 0), sigma)
+        texture_fine = src_l - blur1  # 细纹理 (sigma=2)
+
+        blur2 = cv2.GaussianBlur(src_l, (0, 0), sigma * 2)
+        texture_medium = blur1 - blur2  # 中等纹理
+
+        # 合并纹理: 细纹理权重高，中等纹理权重低
+        texture = texture_fine * 0.7 + texture_medium * 0.3
+
+        # 自适应强度: 在纹理强的区域降低强度 (防止过锐)
+        local_contrast = cv2.GaussianBlur(np.abs(texture), (0, 0), 5)
+        adaptive_strength = strength / (1.0 + local_contrast / 10.0)
+        adaptive_strength = np.clip(adaptive_strength, 0, strength)
+
+        # 皮肤遮罩: 排除眼睛和嘴巴区域
+        skin_mask = np.ones((roi_h_r, roi_w_r), dtype=float)
+
+        if landmarks is not None and len(landmarks) >= 5:
+            lmk = landmarks.astype(np.int32)
+            # 排除眼睛区域 (用椭圆)
+            for pt_idx, scale in [(0, 2.5), (1, 2.5)]:  # 左右眼
+                if pt_idx < len(lmk):
+                    cx = lmk[pt_idx][0] - rx1
+                    cy = lmk[pt_idx][1] - ry1
+                    if 0 <= cx < roi_w_r and 0 <= cy < roi_h_r:
+                        r = int(max(roi_w_r, roi_h_r) * 0.04)
+                        cv2.ellipse(skin_mask, (cx, cy),
+                                    (int(r * 1.5), r), 0, 0, 360, 0.15, -1)
+            # 排除嘴巴区域
+            for pt_idx in [3, 4]:  # 左右嘴角
+                if pt_idx < len(lmk):
+                    cx = lmk[pt_idx][0] - rx1
+                    cy = lmk[pt_idx][1] - ry1
+                    if 0 <= cx < roi_w_r and 0 <= cy < roi_h_r:
+                        cv2.ellipse(skin_mask, (cx, cy),
+                                    (int(roi_w_r * 0.08), int(roi_h_r * 0.04)),
+                                    0, 0, 360, 0.2, -1)
+
+        # 边缘降权
+        center_weight = cv2.GaussianBlur(
+            np.ones((roi_h_r, roi_w_r), dtype=float), (0, 0),
+            min(roi_h_r, roi_w_r) * 0.15
+        )
+        center_weight = (center_weight - center_weight.min()) / (center_weight.max() - center_weight.min() + 1e-6)
+        center_weight = center_weight * 0.3 + 0.7
+
+        skin_mask = skin_mask * center_weight
+        skin_mask = skin_mask.clip(0, 1)
+
+        # 对 L 通道施加纹理
+        enhanced_l = res_l + texture * adaptive_strength * skin_mask
+        enhanced_l = enhanced_l.clip(0, 255)
+
+        # 合成回 LAB → BGR
+        res_lab[..., 0] = enhanced_l
+        enhanced_bgr = cv2.cvtColor(res_lab.clip(0, 255).astype(np.uint8),
+                                     cv2.COLOR_LAB2BGR)
+
+        # 通过皮肤遮罩混合 (只改变皮肤区域)
         skin_mask_3ch = np.stack([skin_mask] * 3, axis=-1)
-
-        # 叠加纹理: result += texture * strength * skin_mask
-        enhanced = res_roi + texture * strength * skin_mask_3ch
-        enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
-
-        # 遮罩混合
-        result = result_img.copy().astype(np.float32)
-        result[y1:y2, x1:x2] = (
-            enhanced.astype(np.float32) * skin_mask_3ch
+        result = result_img.copy().astype(float)
+        result[ry1:ry2, rx1:rx2] = (
+            enhanced_bgr.astype(float) * skin_mask_3ch
             + res_roi * (1.0 - skin_mask_3ch)
         )
-        return np.clip(result, 0, 255).astype(np.uint8)
+        return result.clip(0, 255).astype(np.uint8)
 
     except Exception as e:
         logger.warning(f"皮肤纹理迁移失败: {e}")

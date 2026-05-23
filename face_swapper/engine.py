@@ -173,6 +173,32 @@ class FaceSwapper:
             logger.error(f"模型初始化失败: {e}")
             raise RuntimeError(f"换脸引擎初始化失败: {e}")
 
+    @staticmethod
+    def _get_landmarks(face) -> Optional[np.ndarray]:
+        """获取人脸关键点，兼容不同 insightface 版本
+
+        insightface 中 landmarks 属性名可能为:
+        - 'landmark_2d_106' (106 点, buffalo_l 的 2d106det.onnx)
+        - 'landmarks_2d' (5 点, 旧版兼容)
+
+        Returns:
+            ndarray of shape (N, 2) 或 None
+        """
+        for attr in ('landmark_2d_106', 'landmarks_2d', 'landmark'):
+            val = getattr(face, attr, None)
+            if val is not None:
+                return val
+        # 尝试 dict 访问 (部分版本)
+        for key in ('landmark_2d_106', 'landmarks_2d', 'landmark'):
+            if hasattr(face, '__getitem__'):
+                try:
+                    val = face[key]
+                    if val is not None:
+                        return val
+                except (KeyError, TypeError):
+                    pass
+        return None
+
     def set_det_threshold(self, threshold: float):
         """动态调整人脸检测阈值 (无需重启)
 
@@ -260,8 +286,7 @@ class FaceSwapper:
         enhance_source: bool = True,
         blend: bool = True,
         color_match: bool = True,
-        preserve_eyes: bool = True,
-        skin_texture: bool = True,
+        skin_texture: bool = False,
     ) -> np.ndarray:
         """执行换脸
 
@@ -274,7 +299,6 @@ class FaceSwapper:
             enhance_source: 是否对源人脸做 GFPGAN 增强后再提取特征 (提高相似度)
             blend: 是否使用无缝融合
             color_match: 是否进行颜色迁移，使肤色匹配目标环境
-            preserve_eyes: 是否保留源图眼部特征 (虹膜/睫毛/眼形)
             skin_texture: 是否迁移源图皮肤纹理 (消除塑料感)
 
         Returns:
@@ -303,21 +327,48 @@ class FaceSwapper:
         source_face = source_faces[source_face_idx]
         target_face = target_faces[target_face_idx]
 
-        # 源人脸预增强: 用 GFPGAN 提升源图质量后再提取特征
+        # 源人脸预增强: 增强眼部细节 + GFPGAN 提升质量后再提取特征
         if enhance_source:
             try:
+                # --- 1. 眼部 CLAHE 增强 (让虹膜/睫毛更清晰) ---
+                src_img_enhanced = source_img.copy()
+                src_lmk = self._get_landmarks(source_face)
+                if src_lmk is not None and len(src_lmk) >= 2:
+                    src_eyes = src_lmk[:2].astype(np.int32)
+                    eye_dist = float(np.linalg.norm(
+                        src_eyes[0].astype(float) - src_eyes[1].astype(float)
+                    ))
+                    eye_r = max(int(eye_dist * 0.25), 12)
+                    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+                    for ex, ey in src_eyes:
+                        x1 = max(0, ex - eye_r)
+                        y1 = max(0, ey - eye_r)
+                        x2 = min(source_img.shape[1], ex + eye_r)
+                        y2 = min(source_img.shape[0], ey + eye_r)
+                        roi = src_img_enhanced[y1:y2, x1:x2]
+                        if roi.size > 0:
+                            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                            enhanced_gray = clahe.apply(gray)
+                            # 用 CLAHE 增强的亮度替换原图亮度 (保留颜色)
+                            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV).astype(float)
+                            hsv[..., 2] = hsv[..., 2] * 0.5 + enhanced_gray.astype(float) * 0.5
+                            src_img_enhanced[y1:y2, x1:x2] = cv2.cvtColor(
+                                hsv.clip(0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR
+                            )
+                    logger.info("眼部 CLAHE 增强完成")
+
+                # --- 2. GFPGAN 增强全脸 ---
                 from .enhancer import FaceEnhancer
                 if self._enhancer is None:
                     self._enhancer = FaceEnhancer()
-                # 提取源人脸区域
                 from .utils import crop_face
-                src_face_crop = crop_face(source_img, source_face)
+                bbox_arr = source_face.bbox.astype(np.int32).flatten()
+                src_face_crop = crop_face(src_img_enhanced, bbox_arr)
                 if src_face_crop is not None and src_face_crop.size > 0:
                     enhanced_crop = self._enhancer.enhance(src_face_crop)
-                    # 用增强后的源图重新检测 + 提取特征
+                    # --- 3. 用增强后的源图重新检测 + 提取特征 ---
                     enhanced_faces = self.detect_faces(enhanced_crop, retry_lower_threshold=False)
                     if len(enhanced_faces) > 0:
-                        # 取置信度最高的人脸
                         best = max(enhanced_faces, key=lambda f: f.det_score if hasattr(f, 'det_score') else 1.0)
                         source_face = best
                         logger.info("源人脸预增强完成，重新提取特征")
@@ -340,7 +391,7 @@ class FaceSwapper:
         if color_match:
             try:
                 # 用人脸关键点生成 mask，仅对脸部区域做颜色迁移
-                landmarks = getattr(target_face, 'landmarks_2d', None)
+                landmarks = self._get_landmarks(target_face)
                 mask = np.zeros(target_img.shape[:2], dtype=np.uint8)
                 if landmarks is not None:
                     hull = cv2.convexHull(landmarks.astype(np.int32))
@@ -364,20 +415,17 @@ class FaceSwapper:
         if blend:
             result = self._blend_face(result, target_img, target_face)
 
-        # 可选: 保留源图眼部特征
-        if preserve_eyes:
-            result = self._preserve_eyes(result, source_img, source_face, target_face)
-            logger.info("眼睛保留完成")
-
         # 可选: 皮肤纹理迁移
         if skin_texture:
             try:
                 from .utils import transfer_skin_texture
                 bbox = target_face.bbox.astype(np.int32).flatten()
+                src_lmk = self._get_landmarks(source_face)
                 result = transfer_skin_texture(
                     result, source_img,
                     source_face_roi=(bbox[0], bbox[1], bbox[2], bbox[3]),
-                    strength=0.4, sigma=3.0,
+                    strength=0.35, sigma=2.0,
+                    landmarks=src_lmk,
                 )
                 logger.info("皮肤纹理迁移完成")
             except Exception as e:
@@ -388,92 +436,6 @@ class FaceSwapper:
             result = self.enhance(result, target_faces=[target_face])
 
         return result
-
-    def _preserve_eyes(
-        self,
-        swapped_img: np.ndarray,
-        source_img: np.ndarray,
-        source_face: Any,
-        target_face: Any,
-    ) -> np.ndarray:
-        """将源图的眼部区域保留到换脸结果中
-
-        inswapper 在 128×128 下推理，眼睛细节（虹膜、睫毛、眼形）常丢失。
-        从源图中提取眼部 ROI，叠加到换脸结果上，保留眼睛特征。
-
-        Args:
-            swapped_img: 换脸后的图像
-            source_img: 原始源图像 (BGR)
-            source_face: 源人脸对象
-            target_face: 目标人脸对象
-
-        Returns:
-            保留眼睛后的 BGR 图像
-        """
-        try:
-            src_lmk = getattr(source_face, 'landmarks_2d', None)
-            tgt_lmk = getattr(target_face, 'landmarks_2d', None)
-            if src_lmk is None or tgt_lmk is None or len(src_lmk) < 2:
-                return swapped_img
-
-            src_lmk = src_lmk.astype(np.int32)
-            tgt_lmk = tgt_lmk.astype(np.int32)
-
-            # 两眼间距决定眼部 ROI 大小
-            eye_dist = np.linalg.norm(tgt_lmk[0].astype(float) - tgt_lmk[1].astype(float))
-            eye_w = int(eye_dist * 0.45)
-            eye_h = int(eye_w * 0.55)
-            result = swapped_img.copy()
-
-            for eye_idx in (0, 1):  # 0=左眼, 1=右眼
-                # 在源图中提取眼部 ROI
-                sx, sy = int(src_lmk[eye_idx][0]), int(src_lmk[eye_idx][1])
-                x1 = max(0, sx - eye_w)
-                y1 = max(0, sy - eye_h)
-                x2 = min(source_img.shape[1], sx + eye_w)
-                y2 = min(source_img.shape[0], sy + eye_h)
-                src_eye = source_img[y1:y2, x1:x2]
-                if src_eye.size == 0:
-                    continue
-
-                # 在结果图中的对应位置
-                tx, ty = int(tgt_lmk[eye_idx][0]), int(tgt_lmk[eye_idx][1])
-                rx1 = max(0, tx - eye_w)
-                ry1 = max(0, ty - eye_h)
-                rx2 = min(result.shape[1], tx + eye_w)
-                ry2 = min(result.shape[0], ty + eye_h)
-                roi_w, roi_h = rx2 - rx1, ry2 - ry1
-                if roi_w <= 0 or roi_h <= 0:
-                    continue
-
-                # 统一尺寸
-                if src_eye.shape[1] != roi_w or src_eye.shape[0] != roi_h:
-                    src_eye = cv2.resize(src_eye, (roi_w, roi_h),
-                                         interpolation=cv2.INTER_LANCZOS4)
-
-                # 椭圆遮罩
-                mask = np.zeros((roi_h, roi_w), dtype=np.uint8)
-                cv2.ellipse(mask, (roi_w // 2, roi_h // 2),
-                            (roi_w // 2, roi_h // 2), 0, 0, 360, 255, -1)
-                mask = cv2.GaussianBlur(mask, (13, 13), 7)
-                mask_f = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR).astype(float) / 255.0
-
-                # 70% 源眼 + 30% 结果 (保留源眼特征，同时适应目标光照)
-                blended = (
-                    src_eye.astype(float) * 0.7
-                    + result[ry1:ry2, rx1:rx2].astype(float) * 0.3
-                )
-
-                dst = result[ry1:ry2, rx1:rx2].astype(float)
-                result[ry1:ry2, rx1:rx2] = (
-                    blended * mask_f + dst * (1.0 - mask_f)
-                ).astype(np.uint8)
-
-            return result
-
-        except Exception as e:
-            logger.warning(f"眼睛保留失败，跳过: {e}")
-            return swapped_img
 
     def swap_all_faces(
         self,
@@ -517,76 +479,41 @@ class FaceSwapper:
         original_img: np.ndarray,
         face: Any,
     ) -> np.ndarray:
-        """用 Poisson Blending 改善人像边界"""
+        """高斯加权混合 — 用椭圆遮罩 + soft 边缘实现无痕融合"""
         try:
             bbox = face.bbox.astype(np.int32).flatten()
             x1, y1, x2, y2 = bbox[:4]
 
             # 稍微扩大融合区域
             h, w = original_img.shape[:2]
-            margin = int(max(x2 - x1, y2 - y1) * 0.1)
+            margin = int(max(x2 - x1, y2 - y1) * 0.15)
             x1 = max(0, x1 - margin)
             y1 = max(0, y1 - margin)
             x2 = min(w, x2 + margin)
             y2 = min(h, y2 + margin)
+            roi_h, roi_w = y2 - y1, x2 - x1
 
             # ROI
-            roi_src = swapped_img[y1:y2, x1:x2]
-            roi_dst = original_img[y1:y2, x1:x2]
+            roi_src = swapped_img[y1:y2, x1:x2].astype(np.float32)
+            roi_dst = original_img[y1:y2, x1:x2].astype(np.float32)
 
-            # 创建遮罩 (二值，Poisson 需要硬边界)
-            mask = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
-            landmarks = getattr(face, 'landmarks_2d', None)
-            if landmarks is not None:
-                landmarks = landmarks.astype(np.int32)
-            if landmarks is not None and len(landmarks) >= 5:
-                hull = cv2.convexHull(landmarks)
-                cv2.fillConvexPoly(mask, hull, 255)
-            else:
-                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                axes = ((x2 - x1) // 2, (y2 - y1) // 2)
-                cv2.ellipse(mask, (cx - x1, cy - y1), axes, 0, 0, 360, 255, -1)
+            # 椭圆遮罩 + 高斯模糊边缘
+            mask = np.zeros((roi_h, roi_w), dtype=np.uint8)
+            cx, cy = roi_w // 2, roi_h // 2
+            axes = (roi_w // 2 - 2, roi_h // 2 - 2)
+            cv2.ellipse(mask, (cx, cy), axes, 0, 0, 360, 255, -1)
+            mask_f = cv2.GaussianBlur(mask, (21, 21), 11).astype(float) / 255.0
+            mask_3ch = np.stack([mask_f] * 3, axis=-1)
 
-            # 腐蚀遮罩边缘，避免 Poisson 克隆边界包含背景纹理
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            mask = cv2.erode(mask, kernel, iterations=1)
-
-            # Poisson Blending (梯度域融合)
-            center = ((x2 - x1) // 2, (y2 - y1) // 2)
-            blended = cv2.seamlessClone(
-                roi_src, roi_dst, mask, center, cv2.NORMAL_CLONE
-            )
-
-            result = swapped_img.copy()
+            # 加权混合
+            blended = roi_src * mask_3ch + roi_dst * (1.0 - mask_3ch)
+            result = swapped_img.copy().astype(float)
             result[y1:y2, x1:x2] = blended
-            return result
+            return np.clip(result, 0, 255).astype(np.uint8)
 
         except Exception as e:
-            logger.warning(f"Poisson 混合失败，回退到加权混合: {e}")
-            # 回退: 简单加权混合
-            try:
-                mask = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
-                landmarks = getattr(face, 'landmarks_2d', None)
-                if landmarks is not None:
-                    landmarks = landmarks.astype(np.int32)
-                if landmarks is not None and len(landmarks) >= 5:
-                    hull = cv2.convexHull(landmarks)
-                    cv2.fillConvexPoly(mask, hull, 255)
-                else:
-                    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                    axes = ((x2 - x1) // 2, (y2 - y1) // 2)
-                    cv2.ellipse(mask, (cx - x1, cy - y1), axes, 0, 0, 360, 255, -1)
-                mask = cv2.GaussianBlur(mask, (21, 21), 11)
-                mask_3ch = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR).astype(np.float32) / 255.0
-                blended = (
-                    roi_src.astype(np.float32) * mask_3ch
-                    + roi_dst.astype(np.float32) * (1.0 - mask_3ch)
-                ).astype(np.uint8)
-                result = swapped_img.copy()
-                result[y1:y2, x1:x2] = blended
-                return result
-            except Exception:
-                return swapped_img
+            logger.warning(f"融合失败，跳过: {e}")
+            return swapped_img
 
     def enhance(
         self,

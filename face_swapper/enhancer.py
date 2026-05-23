@@ -46,7 +46,7 @@ class FaceEnhancer:
             # 模型: GFPGANv1.4.pth
             # 背景模型: RestoreFormer.pth 或直接使用 GFPGAN
             self._gfpgan = GFPGANer(
-                model_path=None,  # 使用默认路径
+                model_path="",  # 使用默认路径 (空字符串兼容 GFPGAN≥1.3)
                 upscale=self.upscale,
                 arch="clean",
                 channel_multiplier=2,
