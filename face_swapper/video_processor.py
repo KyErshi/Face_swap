@@ -49,6 +49,8 @@ class VideoProcessor:
         enhance_source: bool = True,
         blend: bool = True,
         color_match: bool = True,
+        preserve_eyes: bool = True,
+        skin_texture: bool = True,
         temporal_smooth: bool = True,
         max_frames: int = 0,  # 0 = 全部帧
         start_frame: int = 0,
@@ -211,6 +213,27 @@ class VideoProcessor:
                             result = self.swapper._blend_face(
                                 result, frame, target_faces[tgt_idx]
                             )
+
+                        if preserve_eyes:
+                            try:
+                                result = self.swapper._preserve_eyes(
+                                    result, source_img, source_face,
+                                    target_faces[tgt_idx]
+                                )
+                            except Exception as e:
+                                logger.warning(f"帧 {frame_idx} 眼睛保留失败: {e}")
+
+                        if skin_texture:
+                            try:
+                                from .utils import transfer_skin_texture
+                                bbox = target_faces[tgt_idx].bbox.astype(np.int32).flatten()
+                                result = transfer_skin_texture(
+                                    result, source_img,
+                                    source_face_roi=(bbox[0], bbox[1], bbox[2], bbox[3]),
+                                    strength=0.3, sigma=3.0,
+                                )
+                            except Exception as e:
+                                logger.warning(f"帧 {frame_idx} 皮肤纹理失败: {e}")
 
                         if color_match:
                             try:

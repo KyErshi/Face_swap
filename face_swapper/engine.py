@@ -260,6 +260,8 @@ class FaceSwapper:
         enhance_source: bool = True,
         blend: bool = True,
         color_match: bool = True,
+        preserve_eyes: bool = True,
+        skin_texture: bool = True,
     ) -> np.ndarray:
         """执行换脸
 
@@ -272,6 +274,8 @@ class FaceSwapper:
             enhance_source: 是否对源人脸做 GFPGAN 增强后再提取特征 (提高相似度)
             blend: 是否使用无缝融合
             color_match: 是否进行颜色迁移，使肤色匹配目标环境
+            preserve_eyes: 是否保留源图眼部特征 (虹膜/睫毛/眼形)
+            skin_texture: 是否迁移源图皮肤纹理 (消除塑料感)
 
         Returns:
             换脸后的 BGR 图像
@@ -360,11 +364,116 @@ class FaceSwapper:
         if blend:
             result = self._blend_face(result, target_img, target_face)
 
+        # 可选: 保留源图眼部特征
+        if preserve_eyes:
+            result = self._preserve_eyes(result, source_img, source_face, target_face)
+            logger.info("眼睛保留完成")
+
+        # 可选: 皮肤纹理迁移
+        if skin_texture:
+            try:
+                from .utils import transfer_skin_texture
+                bbox = target_face.bbox.astype(np.int32).flatten()
+                result = transfer_skin_texture(
+                    result, source_img,
+                    source_face_roi=(bbox[0], bbox[1], bbox[2], bbox[3]),
+                    strength=0.4, sigma=3.0,
+                )
+                logger.info("皮肤纹理迁移完成")
+            except Exception as e:
+                logger.warning(f"皮肤纹理迁移失败，跳过: {e}")
+
         # 可选: GFPGAN 增强
         if enhance:
             result = self.enhance(result, target_faces=[target_face])
 
         return result
+
+    def _preserve_eyes(
+        self,
+        swapped_img: np.ndarray,
+        source_img: np.ndarray,
+        source_face: Any,
+        target_face: Any,
+    ) -> np.ndarray:
+        """将源图的眼部区域保留到换脸结果中
+
+        inswapper 在 128×128 下推理，眼睛细节（虹膜、睫毛、眼形）常丢失。
+        从源图中提取眼部 ROI，叠加到换脸结果上，保留眼睛特征。
+
+        Args:
+            swapped_img: 换脸后的图像
+            source_img: 原始源图像 (BGR)
+            source_face: 源人脸对象
+            target_face: 目标人脸对象
+
+        Returns:
+            保留眼睛后的 BGR 图像
+        """
+        try:
+            src_lmk = getattr(source_face, 'landmarks_2d', None)
+            tgt_lmk = getattr(target_face, 'landmarks_2d', None)
+            if src_lmk is None or tgt_lmk is None or len(src_lmk) < 2:
+                return swapped_img
+
+            src_lmk = src_lmk.astype(np.int32)
+            tgt_lmk = tgt_lmk.astype(np.int32)
+
+            # 两眼间距决定眼部 ROI 大小
+            eye_dist = np.linalg.norm(tgt_lmk[0].astype(float) - tgt_lmk[1].astype(float))
+            eye_w = int(eye_dist * 0.45)
+            eye_h = int(eye_w * 0.55)
+            result = swapped_img.copy()
+
+            for eye_idx in (0, 1):  # 0=左眼, 1=右眼
+                # 在源图中提取眼部 ROI
+                sx, sy = int(src_lmk[eye_idx][0]), int(src_lmk[eye_idx][1])
+                x1 = max(0, sx - eye_w)
+                y1 = max(0, sy - eye_h)
+                x2 = min(source_img.shape[1], sx + eye_w)
+                y2 = min(source_img.shape[0], sy + eye_h)
+                src_eye = source_img[y1:y2, x1:x2]
+                if src_eye.size == 0:
+                    continue
+
+                # 在结果图中的对应位置
+                tx, ty = int(tgt_lmk[eye_idx][0]), int(tgt_lmk[eye_idx][1])
+                rx1 = max(0, tx - eye_w)
+                ry1 = max(0, ty - eye_h)
+                rx2 = min(result.shape[1], tx + eye_w)
+                ry2 = min(result.shape[0], ty + eye_h)
+                roi_w, roi_h = rx2 - rx1, ry2 - ry1
+                if roi_w <= 0 or roi_h <= 0:
+                    continue
+
+                # 统一尺寸
+                if src_eye.shape[1] != roi_w or src_eye.shape[0] != roi_h:
+                    src_eye = cv2.resize(src_eye, (roi_w, roi_h),
+                                         interpolation=cv2.INTER_LANCZOS4)
+
+                # 椭圆遮罩
+                mask = np.zeros((roi_h, roi_w), dtype=np.uint8)
+                cv2.ellipse(mask, (roi_w // 2, roi_h // 2),
+                            (roi_w // 2, roi_h // 2), 0, 0, 360, 255, -1)
+                mask = cv2.GaussianBlur(mask, (13, 13), 7)
+                mask_f = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR).astype(float) / 255.0
+
+                # 70% 源眼 + 30% 结果 (保留源眼特征，同时适应目标光照)
+                blended = (
+                    src_eye.astype(float) * 0.7
+                    + result[ry1:ry2, rx1:rx2].astype(float) * 0.3
+                )
+
+                dst = result[ry1:ry2, rx1:rx2].astype(float)
+                result[ry1:ry2, rx1:rx2] = (
+                    blended * mask_f + dst * (1.0 - mask_f)
+                ).astype(np.uint8)
+
+            return result
+
+        except Exception as e:
+            logger.warning(f"眼睛保留失败，跳过: {e}")
+            return swapped_img
 
     def swap_all_faces(
         self,

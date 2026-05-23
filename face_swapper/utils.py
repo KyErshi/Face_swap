@@ -140,6 +140,75 @@ def color_transfer(
     return result_bgr
 
 
+def transfer_skin_texture(
+    result_img: np.ndarray,
+    source_img: np.ndarray,
+    source_face_roi: tuple,
+    strength: float = 0.4,
+    sigma: float = 3.0,
+) -> np.ndarray:
+    """迁移源人脸皮肤纹理到换脸结果
+
+    通过高斯差分提取源图皮肤的高频纹理（毛孔、皮肤细节），
+    叠加到换脸结果中，消除"塑料感"。
+
+    Args:
+        result_img: 换脸后的 BGR 图像
+        source_img: 原始源 BGR 图像
+        source_face_roi: (x1, y1, x2, y2) 人脸框区域
+        strength: 纹理强度 0~1，默认 0.4
+        sigma: 高斯模糊 sigma，控制纹理尺度，默认 3.0
+
+    Returns:
+        叠加纹理后的 BGR 图像
+    """
+    try:
+        x1, y1, x2, y2 = source_face_roi
+        h, w = source_img.shape[:2]
+        margin = int(max(x2 - x1, y2 - y1) * 0.15)
+        x1 = max(0, x1 - margin)
+        y1 = max(0, y1 - margin)
+        x2 = min(w, x2 + margin)
+        y2 = min(h, y2 + margin)
+        roi_h, roi_w = y2 - y1, x2 - x1
+        if roi_w <= 16 or roi_h <= 16:
+            return result_img
+
+        src_roi = source_img[y1:y2, x1:x2].astype(np.float32)
+        res_roi = result_img[y1:y2, x1:x2].astype(np.float32)
+        if src_roi.shape != res_roi.shape:
+            src_roi = cv2.resize(src_roi, (roi_w, roi_h))
+
+        # 高斯差分提取源图的高频细节 (纹理)
+        src_blur = cv2.GaussianBlur(src_roi, (0, 0), sigma)
+        texture = src_roi - src_blur  # 高频 = 毛孔、皮肤细节
+
+        # 皮肤区域遮罩 (不覆盖眼睛、嘴、发际线边缘)
+        skin_mask = np.ones((roi_h, roi_w), dtype=np.float32) * 0.6
+        featheredge = 8
+        # 边缘淡出
+        cv2.rectangle(skin_mask, (0, 0), (roi_w, roi_h), 0.4, featheredge)
+        skin_mask[featheredge:-featheredge, featheredge:-featheredge] = 1.0
+        skin_mask = cv2.GaussianBlur(skin_mask, (15, 15), 7)
+        skin_mask_3ch = np.stack([skin_mask] * 3, axis=-1)
+
+        # 叠加纹理: result += texture * strength * skin_mask
+        enhanced = res_roi + texture * strength * skin_mask_3ch
+        enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
+
+        # 遮罩混合
+        result = result_img.copy().astype(np.float32)
+        result[y1:y2, x1:x2] = (
+            enhanced.astype(np.float32) * skin_mask_3ch
+            + res_roi * (1.0 - skin_mask_3ch)
+        )
+        return np.clip(result, 0, 255).astype(np.uint8)
+
+    except Exception as e:
+        logger.warning(f"皮肤纹理迁移失败: {e}")
+        return result_img
+
+
 def blend_images(
     foreground: np.ndarray,
     background: np.ndarray,

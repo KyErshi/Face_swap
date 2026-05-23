@@ -86,6 +86,8 @@ def image_swap(
     enable_enhance_source: bool,
     enable_blend: bool,
     enable_color_match: bool,
+    enable_preserve_eyes: bool,
+    enable_skin_texture: bool,
     progress: gr.Progress = gr.Progress(),
 ) -> Tuple[np.ndarray, str, str]:
     """图片换脸主函数"""
@@ -115,6 +117,8 @@ def image_swap(
             enhance_source=enable_enhance_source,
             blend=enable_blend,
             color_match=enable_color_match,
+            preserve_eyes=enable_preserve_eyes,
+            skin_texture=enable_skin_texture,
         )
     except ValueError as e:
         raise gr.Error(str(e))
@@ -186,6 +190,8 @@ def video_swap(
     enable_enhance_source: bool,
     enable_blend: bool,
     enable_color_match: bool,
+    enable_preserve_eyes: bool,
+    enable_skin_texture: bool,
     enable_temporal_smooth: bool,
     keep_audio: bool,
     process_seconds: int,
@@ -259,6 +265,8 @@ def video_swap(
             enhance_source=enable_enhance_source,
             blend=enable_blend,
             color_match=enable_color_match,
+            preserve_eyes=enable_preserve_eyes,
+            skin_texture=enable_skin_texture,
             temporal_smooth=enable_temporal_smooth,
             max_frames=max_frames,
             keep_audio=keep_audio,
@@ -359,6 +367,12 @@ def build_app() -> gr.Blocks:
                             label="颜色匹配 (消除肤色色差)",
                             value=True,
                         )
+                        enable_preserve_eyes = gr.Checkbox(
+                            label="保留眼形", value=True
+                        )
+                        enable_skin_texture = gr.Checkbox(
+                            label="皮肤纹理", value=True
+                        )
                     det_threshold_slider = gr.Slider(
                         minimum=0.1,
                         maximum=0.9,
@@ -458,6 +472,8 @@ def build_app() -> gr.Blocks:
                         enable_enhance_source,
                         enable_blend,
                         enable_color_match,
+                        enable_preserve_eyes,
+                        enable_skin_texture,
                     ],
                     outputs=[output_img, status_msg],
                 )
@@ -504,6 +520,12 @@ def build_app() -> gr.Blocks:
                         )
                         v_enhance_source = gr.Checkbox(
                             label="源人脸增强", value=True
+                        )
+                        v_preserve_eyes = gr.Checkbox(
+                            label="保留眼形", value=True
+                        )
+                        v_skin_texture = gr.Checkbox(
+                            label="皮肤纹理", value=True
                         )
                     v_process_seconds = gr.Slider(
                         minimum=0,
@@ -556,6 +578,8 @@ def build_app() -> gr.Blocks:
                         v_enhance_source,
                         v_blend,
                         v_color_match,
+                        v_preserve_eyes,
+                        v_skin_texture,
                         v_temporal_smooth,
                         v_keep_audio,
                         v_process_seconds,
