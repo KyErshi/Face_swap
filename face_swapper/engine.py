@@ -505,44 +505,74 @@ class FaceSwapper:
         if blend:
             result = self._blend_face(result, target_img, target_face)
 
-        # 眼部 CLAHE+USM+DoG 增强: 在整图上用圆形高斯遮罩，无 ROI 裁剪无色块
+        # 双眼部 + 全脸细节增强 (CLAHE/USM/DoG，整图操作无色块)
         try:
             tgt_lmk = self._get_landmarks(target_face)
             if tgt_lmk is not None and len(tgt_lmk) >= 2:
+                # ---- 生成遮罩 ----
+                # 面部轮廓遮罩 (全脸区域)
+                face_mask = np.zeros(result.shape[:2], dtype=np.uint8)
+                if len(tgt_lmk) >= 33:
+                    cv2.fillConvexPoly(face_mask, tgt_lmk[:33].astype(np.int32), 255)
+                elif len(tgt_lmk) >= 5:
+                    cv2.fillConvexPoly(face_mask, cv2.convexHull(tgt_lmk.astype(np.int32)), 255)
+                else:
+                    b = target_face.bbox.astype(np.int32).flatten()
+                    cv2.ellipse(face_mask, ((b[0]+b[2])//2, (b[1]+b[3])//2),
+                                ((b[2]-b[0])//2, (b[3]-b[1])//2), 0, 0, 360, 255, -1)
+                face_mask = cv2.GaussianBlur(face_mask, (41, 41), 20)
+                face_mask_f = face_mask.astype(np.float32) / 255.0
+
+                # 眼部加强遮罩 (双眼区域，更高的增强强度)
                 eyes = tgt_lmk[:2].astype(np.int32)
                 eye_dist = float(np.linalg.norm(eyes[0].astype(float) - eyes[1].astype(float)))
-                eye_r = max(int(eye_dist * 0.25), 12)
-
-                # 整图灰度 CLAHE+USM+DoG
-                gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
-                clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(3, 3))
-                eg = clahe.apply(gray)
-                blur = cv2.GaussianBlur(eg, (0, 0), 1.5)
-                usm = cv2.addWeighted(eg, 1.8, blur, -0.8, 0)
-                fine = cv2.GaussianBlur(usm, (0, 0), 0.5)
-                coarse = cv2.GaussianBlur(usm, (0, 0), 3.0)
-                detail = cv2.subtract(fine, coarse)
-                final_gray = np.clip(usm.astype(float) + detail.astype(float) * 0.4, 0, 255).astype(np.uint8)
-
-                # 整图转 HSV，只在眼部位置用圆形高斯遮罩修改 V 通道
-                hsv = cv2.cvtColor(result, cv2.COLOR_BGR2HSV).astype(float)
-                eye_mask_sum = np.zeros(result.shape[:2], dtype=np.float32)
+                eye_r = max(int(eye_dist * 0.28), 14)
+                eye_mask = np.zeros(result.shape[:2], dtype=np.float32)
                 for ex, ey in eyes:
-                    # 在整图上绘制圆形高斯遮罩
                     yy, xx = np.ogrid[:result.shape[0], :result.shape[1]]
                     dist = np.sqrt((xx - ex)**2 + (yy - ey)**2)
-                    single_mask = np.clip(1.0 - dist / eye_r, 0, 1)
-                    # 高斯羽化
-                    single_mask = cv2.GaussianBlur(single_mask, (0, 0), eye_r * 0.35)
-                    eye_mask_sum = np.maximum(eye_mask_sum, single_mask)
+                    m = np.clip(1.0 - dist / eye_r, 0, 1)
+                    m = cv2.GaussianBlur(m, (0, 0), eye_r * 0.3)
+                    eye_mask = np.maximum(eye_mask, m)
+                eye_mask = np.clip(eye_mask, 0, 1)
 
-                eye_mask_sum = np.clip(eye_mask_sum, 0, 1)
-                # V = 原V * (1-遮罩) + 增强灰度 * 遮罩
-                hsv[..., 2] = hsv[..., 2] * (1.0 - eye_mask_sum) + final_gray.astype(float) * eye_mask_sum
+                # ---- 图像处理 ----
+                gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
+
+                # 全脸: 轻度 CLAHE + USM (lift=1.5)
+                clahe_face = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+                eg_face = clahe_face.apply(gray)
+                blur_face = cv2.GaussianBlur(eg_face, (0, 0), 1.8)
+                usm_face = cv2.addWeighted(eg_face, 1.5, blur_face, -0.5, 0)
+
+                # 眼部: 强力 CLAHE + USM + DoG (lift=1.8, detail×0.5)
+                clahe_eye = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(3, 3))
+                eg_eye = clahe_eye.apply(gray)
+                blur_eye = cv2.GaussianBlur(eg_eye, (0, 0), 1.5)
+                usm_eye = cv2.addWeighted(eg_eye, 1.8, blur_eye, -0.8, 0)
+                fine = cv2.GaussianBlur(usm_eye, (0, 0), 0.5)
+                coarse = cv2.GaussianBlur(usm_eye, (0, 0), 3.0)
+                detail = cv2.subtract(fine, coarse)
+                eye_final = np.clip(usm_eye.astype(float) + detail.astype(float) * 0.5, 0, 255).astype(np.uint8)
+
+                # ---- 合成: V 通道混合 ----
+                # 策略: 眼部用强力增强，全脸用轻度增强，遮罩边缘自然过渡
+                hsv = cv2.cvtColor(result, cv2.COLOR_BGR2HSV).astype(float)
+                orig_v = hsv[..., 2].copy()
+
+                # 全脸区域: 70% 原亮度 + 30% 轻度增强
+                hsv[..., 2] = (orig_v * (1 - face_mask_f * 0.30)
+                               + usm_face.astype(float) * face_mask_f * 0.30)
+
+                # 眼部区域: 叠加强力增强 (以眼部遮罩为准)
+                blend_eye = orig_v * (1 - eye_mask * 0.55) + eye_final.astype(float) * eye_mask * 0.55
+                # 仅眼部遮罩内生效
+                hsv[..., 2] = hsv[..., 2] * (1 - eye_mask) + blend_eye * eye_mask
+
                 result = cv2.cvtColor(hsv.clip(0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR)
-                logger.info("眼部 CLAHE+USM+DoG 完成 — 整图高斯遮罩无色块")
+                logger.info("双眼部+全脸细节增强完成")
         except Exception as e:
-            logger.warning(f"眼部增强失败: {e}")
+            logger.warning(f"细节增强失败: {e}")
 
         # 可选: 皮肤纹理迁移
         if skin_texture:

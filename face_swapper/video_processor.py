@@ -340,33 +340,54 @@ class VideoProcessor:
                             except Exception as e:
                                 logger.warning(f"帧 {frame_idx} 颜色迁移失败: {e}")
 
-                        # 眼部 CLAHE+USM+DoG: 整图操作 + 圆形高斯遮罩，无色块
+                        # 双眼部+全脸细节增强 (CLAHE/USM/DoG，整图无色块)
                         try:
                             tgt_face = target_faces[tgt_idx]
                             tgt_lmk = self.swapper._get_landmarks(tgt_face)
                             if tgt_lmk is not None and len(tgt_lmk) >= 2:
+                                # 面部轮廓遮罩
+                                face_mask = np.zeros(result.shape[:2], dtype=np.uint8)
+                                if len(tgt_lmk) >= 33:
+                                    cv2.fillConvexPoly(face_mask, tgt_lmk[:33].astype(np.int32), 255)
+                                elif len(tgt_lmk) >= 5:
+                                    cv2.fillConvexPoly(face_mask, cv2.convexHull(tgt_lmk.astype(np.int32)), 255)
+                                else:
+                                    b = tgt_face.bbox.astype(np.int32).flatten()
+                                    cv2.ellipse(face_mask, ((b[0]+b[2])//2,(b[1]+b[3])//2),
+                                                ((b[2]-b[0])//2,(b[3]-b[1])//2), 0, 0, 360, 255, -1)
+                                face_mask_f = cv2.GaussianBlur(face_mask, (41, 41), 20).astype(float) / 255.0
+                                # 眼部遮罩
                                 eyes = tgt_lmk[:2].astype(np.int32)
                                 eye_dist = float(np.linalg.norm(eyes[0].astype(float) - eyes[1].astype(float)))
-                                eye_r = max(int(eye_dist * 0.25), 12)
-                                gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
-                                clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(3, 3))
-                                eg = clahe.apply(gray)
-                                blur = cv2.GaussianBlur(eg, (0, 0), 1.5)
-                                usm = cv2.addWeighted(eg, 1.8, blur, -0.8, 0)
-                                fine = cv2.GaussianBlur(usm, (0, 0), 0.5)
-                                coarse = cv2.GaussianBlur(usm, (0, 0), 3.0)
-                                detail = cv2.subtract(fine, coarse)
-                                final_gray = np.clip(usm.astype(float) + detail.astype(float) * 0.4, 0, 255).astype(np.uint8)
-                                hsv = cv2.cvtColor(result, cv2.COLOR_BGR2HSV).astype(float)
+                                eye_r = max(int(eye_dist * 0.28), 14)
                                 eye_mask = np.zeros(result.shape[:2], dtype=np.float32)
                                 for ex, ey in eyes:
                                     yy, xx = np.ogrid[:result.shape[0], :result.shape[1]]
                                     dist = np.sqrt((xx - ex)**2 + (yy - ey)**2)
                                     m = np.clip(1.0 - dist / eye_r, 0, 1)
-                                    m = cv2.GaussianBlur(m, (0, 0), eye_r * 0.35)
+                                    m = cv2.GaussianBlur(m, (0, 0), eye_r * 0.3)
                                     eye_mask = np.maximum(eye_mask, m)
                                 eye_mask = np.clip(eye_mask, 0, 1)
-                                hsv[..., 2] = hsv[..., 2] * (1.0 - eye_mask) + final_gray.astype(float) * eye_mask
+                                # 图像处理
+                                gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
+                                # 全脸轻度
+                                cfa = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+                                eg_f = cfa.apply(gray)
+                                usm_f = cv2.addWeighted(eg_f, 1.5, cv2.GaussianBlur(eg_f, (0, 0), 1.8), -0.5, 0)
+                                # 眼部强力
+                                ce = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(3, 3))
+                                eg_e = ce.apply(gray)
+                                usm_e = cv2.addWeighted(eg_e, 1.8, cv2.GaussianBlur(eg_e, (0, 0), 1.5), -0.8, 0)
+                                fine = cv2.GaussianBlur(usm_e, (0, 0), 0.5)
+                                coarse = cv2.GaussianBlur(usm_e, (0, 0), 3.0)
+                                detail = cv2.subtract(fine, coarse)
+                                eye_final = np.clip(usm_e.astype(float) + detail.astype(float) * 0.5, 0, 255).astype(np.uint8)
+                                # 混合
+                                hsv = cv2.cvtColor(result, cv2.COLOR_BGR2HSV).astype(float)
+                                ov = hsv[..., 2].copy()
+                                hsv[..., 2] = ov * (1 - face_mask_f * 0.30) + usm_f.astype(float) * face_mask_f * 0.30
+                                blend_e = ov * (1 - eye_mask * 0.55) + eye_final.astype(float) * eye_mask * 0.55
+                                hsv[..., 2] = hsv[..., 2] * (1 - eye_mask) + blend_e * eye_mask
                                 result = cv2.cvtColor(hsv.clip(0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR)
                         except Exception:
                             pass
