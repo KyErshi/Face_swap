@@ -109,7 +109,8 @@ def color_transfer(
 
     result = src_lab.copy()
 
-    for c in range(3):
+    # 只迁移 AB 色度通道 (c=1,2)，保留 L 亮度通道 (c=0) 避免亮度失真
+    for c in range(1, 3):
         if mask is not None:
             # 仅在 mask 区域计算统计
             mask_f = mask.astype(np.float32) / 255.0

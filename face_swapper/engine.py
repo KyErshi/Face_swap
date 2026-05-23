@@ -327,6 +327,14 @@ class FaceSwapper:
         source_face = source_faces[source_face_idx]
         target_face = target_faces[target_face_idx]
 
+        # 保存原始 embedding (用于后续融合)
+        original_src_embedding = getattr(source_face, 'normed_embedding', None)
+
+        # 保存源人脸 crop (用于后续纹理迁移)
+        self._src_face_crop = None
+        self._enhanced_crop = None
+        self._crop_origin = None
+
         # 源人脸预增强: GFPGAN 提全脸质量 → 眼部多尺度细节增强
         if enhance_source:
             try:
@@ -338,11 +346,18 @@ class FaceSwapper:
                 # --- 1. 先 GFPGAN 增强全脸 (改善整体质量) ---
                 bbox_arr = source_face.bbox.astype(np.int32).flatten()
                 src_face_crop = crop_face(source_img, bbox_arr)
+                self._src_face_crop = src_face_crop
+                # 保存 crop 原点 (margin 同 crop_face: margin=0.3)
+                self._crop_origin = (
+                    max(0, bbox_arr[0] - int((bbox_arr[2] - bbox_arr[0]) * 0.3)),
+                    max(0, bbox_arr[1] - int((bbox_arr[3] - bbox_arr[1]) * 0.3)),
+                )
                 enhanced_crop = src_face_crop.copy()
                 if src_face_crop is not None and src_face_crop.size > 0:
                     gfpgan_result = self._enhancer.enhance(src_face_crop)
                     if gfpgan_result is not None:
                         enhanced_crop = gfpgan_result
+                        self._enhanced_crop = enhanced_crop
 
                 # --- 2. 在 GFPGAN 之后的图上做眼部多尺度细节增强 ---
                 src_lmk = self._get_landmarks(source_face)
@@ -388,14 +403,65 @@ class FaceSwapper:
                         enhanced_crop[y1:y2, x1:x2] = cv2.cvtColor(
                             hsv.clip(0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR
                         )
+                    self._enhanced_crop = enhanced_crop  # 保存增强后的 crop (含眼部)
                     logger.info("眼部多尺度细节增强完成 (CLAHE+USM+DoG)")
 
-                    # --- 3. 用增强后的图重新检测 + 提取特征 ---
+                # --- 3. 将增强后的脸贴回原图 (保留上下文) 再重新检测 ---
+                # 裁剪时加了 margin，需用相同扩展区域贴回
+                face_w = bbox_arr[2] - bbox_arr[0]
+                face_h = bbox_arr[3] - bbox_arr[1]
+                margin_x = int(face_w * 0.3)
+                margin_y = int(face_h * 0.3)
+                px1 = max(0, bbox_arr[0] - margin_x)
+                py1 = max(0, bbox_arr[1] - margin_y)
+                px2 = min(source_img.shape[1], bbox_arr[2] + margin_x)
+                py2 = min(source_img.shape[0], bbox_arr[3] + margin_y)
+                paste_h, paste_w = py2 - py1, px2 - px1
+
+                enhanced_full = source_img.copy().astype(np.float32)
+                # 缩放 enhanced_crop 到 paste 区域尺寸
+                paste = cv2.resize(enhanced_crop, (paste_w, paste_h))
+                # 羽化边缘融合
+                mask_paste = np.zeros((paste_h, paste_w), dtype=np.float32)
+                cv2.ellipse(mask_paste, (paste_w//2, paste_h//2),
+                            (paste_w//2-4, paste_h//2-4), 0, 0, 360, 1.0, -1)
+                mask_paste = cv2.GaussianBlur(mask_paste, (31, 31), 15)
+                mask_paste = np.clip(mask_paste, 0, 1)
+                mask_3ch = np.stack([mask_paste] * 3, axis=-1)
+                roi = enhanced_full[py1:py2, px1:px2].copy()
+                blended_roi = paste.astype(np.float32) * mask_3ch + roi * (1.0 - mask_3ch)
+                enhanced_full[py1:py2, px1:px2] = blended_roi
+                enhanced_full = np.clip(enhanced_full, 0, 255).astype(np.uint8)
+
+                # 在完整图上重新检测 (有上下文，embedding 更准)
+                enhanced_faces = self.detect_faces(enhanced_full, retry_lower_threshold=False)
+                if len(enhanced_faces) > 0:
+                    best = max(enhanced_faces, key=lambda f: f.det_score if hasattr(f, 'det_score') else 1.0)
+                    # 融合 embedding: 原始(有上下文身份) + 增强(有纹理细节)
+                    enhanced_embedding = getattr(best, 'normed_embedding', None)
+                    if original_src_embedding is not None and enhanced_embedding is not None:
+                        # 等权平均后归一化
+                        fused = (original_src_embedding + enhanced_embedding).astype(np.float32)
+                        fused /= np.linalg.norm(fused)
+                        best.normed_embedding = fused
+                        logger.info("源人脸预增强完成，融合双 embedding 提升相似度")
+                    else:
+                        logger.info("源人脸预增强完成，使用增强后 embedding (无法融合)")
+                    source_face = best
+                else:
+                    # 回退: 在裁剪图上检测
                     enhanced_faces = self.detect_faces(enhanced_crop, retry_lower_threshold=False)
                     if len(enhanced_faces) > 0:
                         best = max(enhanced_faces, key=lambda f: f.det_score if hasattr(f, 'det_score') else 1.0)
+                        enhanced_embedding = getattr(best, 'normed_embedding', None)
+                        if original_src_embedding is not None and enhanced_embedding is not None:
+                            fused = (original_src_embedding + enhanced_embedding).astype(np.float32)
+                            fused /= np.linalg.norm(fused)
+                            best.normed_embedding = fused
+                            logger.info("源人脸预增强完成，融合双 embedding (裁剪回退)")
+                        else:
+                            logger.info("源人脸预增强完成，回退到裁剪图检测 (无法融合)")
                         source_face = best
-                        logger.info("源人脸预增强完成，重新提取特征")
             except Exception as e:
                 logger.warning(f"源人脸预增强失败，使用原始特征: {e}")
 
@@ -438,6 +504,45 @@ class FaceSwapper:
         # 可选: 无缝融合 (减少边界伪影)
         if blend:
             result = self._blend_face(result, target_img, target_face)
+
+        # 眼部 CLAHE+USM+DoG 增强: 在整图上用圆形高斯遮罩，无 ROI 裁剪无色块
+        try:
+            tgt_lmk = self._get_landmarks(target_face)
+            if tgt_lmk is not None and len(tgt_lmk) >= 2:
+                eyes = tgt_lmk[:2].astype(np.int32)
+                eye_dist = float(np.linalg.norm(eyes[0].astype(float) - eyes[1].astype(float)))
+                eye_r = max(int(eye_dist * 0.25), 12)
+
+                # 整图灰度 CLAHE+USM+DoG
+                gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
+                clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(3, 3))
+                eg = clahe.apply(gray)
+                blur = cv2.GaussianBlur(eg, (0, 0), 1.5)
+                usm = cv2.addWeighted(eg, 1.8, blur, -0.8, 0)
+                fine = cv2.GaussianBlur(usm, (0, 0), 0.5)
+                coarse = cv2.GaussianBlur(usm, (0, 0), 3.0)
+                detail = cv2.subtract(fine, coarse)
+                final_gray = np.clip(usm.astype(float) + detail.astype(float) * 0.4, 0, 255).astype(np.uint8)
+
+                # 整图转 HSV，只在眼部位置用圆形高斯遮罩修改 V 通道
+                hsv = cv2.cvtColor(result, cv2.COLOR_BGR2HSV).astype(float)
+                eye_mask_sum = np.zeros(result.shape[:2], dtype=np.float32)
+                for ex, ey in eyes:
+                    # 在整图上绘制圆形高斯遮罩
+                    yy, xx = np.ogrid[:result.shape[0], :result.shape[1]]
+                    dist = np.sqrt((xx - ex)**2 + (yy - ey)**2)
+                    single_mask = np.clip(1.0 - dist / eye_r, 0, 1)
+                    # 高斯羽化
+                    single_mask = cv2.GaussianBlur(single_mask, (0, 0), eye_r * 0.35)
+                    eye_mask_sum = np.maximum(eye_mask_sum, single_mask)
+
+                eye_mask_sum = np.clip(eye_mask_sum, 0, 1)
+                # V = 原V * (1-遮罩) + 增强灰度 * 遮罩
+                hsv[..., 2] = hsv[..., 2] * (1.0 - eye_mask_sum) + final_gray.astype(float) * eye_mask_sum
+                result = cv2.cvtColor(hsv.clip(0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR)
+                logger.info("眼部 CLAHE+USM+DoG 完成 — 整图高斯遮罩无色块")
+        except Exception as e:
+            logger.warning(f"眼部增强失败: {e}")
 
         # 可选: 皮肤纹理迁移
         if skin_texture:

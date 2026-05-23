@@ -86,6 +86,9 @@ class VideoProcessor:
             )
         source_face = source_faces[source_face_idx]
 
+        # 保存原始 embedding (用于后续融合)
+        original_src_embedding = getattr(source_face, 'normed_embedding', None)
+
         # 源人脸预增强: GFPGAN → 眼部多尺度细节增强
         if enhance_source:
             try:
@@ -96,11 +99,16 @@ class VideoProcessor:
                 # --- 1. 先 GFPGAN 增强全脸 ---
                 bbox_arr = source_face.bbox.astype(np.int32).flatten()
                 src_face_crop = crop_face(source_img, bbox_arr)
+                self._src_crop_video = src_face_crop
+                # 保存 crop 原点偏移 (用于后续精确对齐)
+                self._crop_ox = max(0, bbox_arr[0] - int((bbox_arr[2]-bbox_arr[0])*0.3))
+                self._crop_oy = max(0, bbox_arr[1] - int((bbox_arr[3]-bbox_arr[1])*0.3))
                 enhanced_crop = src_face_crop.copy()
                 if src_face_crop is not None and src_face_crop.size > 0:
                     gfpgan_result = enhancer.enhance(src_face_crop)
                     if gfpgan_result is not None:
                         enhanced_crop = gfpgan_result
+                        self._crop_enhanced_video = enhanced_crop
 
                 # --- 2. 在 GFPGAN 结果上做眼部多尺度细节增强 ---
                 src_lmk = self.swapper._get_landmarks(source_face)
@@ -139,13 +147,58 @@ class VideoProcessor:
                         enhanced_crop[y1:y2, x1:x2] = cv2.cvtColor(
                             hsv.clip(0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR
                         )
+                    self._crop_enhanced_video = enhanced_crop  # 保存储最终增强 crop
                     logger.info("视频眼部多尺度细节增强完成 (CLAHE+USM+DoG)")
 
-                    enhanced_faces = self.swapper.detect_faces(enhanced_crop, retry_lower_threshold=False)
+                    # --- 3. 贴回原图再检测 (保留上下文) ---
+                    face_w = bbox_arr[2] - bbox_arr[0]
+                    face_h = bbox_arr[3] - bbox_arr[1]
+                    margin_x = int(face_w * 0.3)
+                    margin_y = int(face_h * 0.3)
+                    px1 = max(0, bbox_arr[0] - margin_x)
+                    py1 = max(0, bbox_arr[1] - margin_y)
+                    px2 = min(source_img.shape[1], bbox_arr[2] + margin_x)
+                    py2 = min(source_img.shape[0], bbox_arr[3] + margin_y)
+                    paste_h, paste_w = py2 - py1, px2 - px1
+
+                    enhanced_full = source_img.copy().astype(np.float32)
+                    paste = cv2.resize(enhanced_crop, (paste_w, paste_h))
+                    mask_paste = np.zeros((paste_h, paste_w), dtype=np.float32)
+                    cv2.ellipse(mask_paste, (paste_w//2, paste_h//2),
+                                (paste_w//2-4, paste_h//2-4), 0, 0, 360, 1.0, -1)
+                    mask_paste = cv2.GaussianBlur(mask_paste, (31, 31), 15)
+                    mask_paste = np.clip(mask_paste, 0, 1)
+                    mask_3ch = np.stack([mask_paste] * 3, axis=-1)
+                    roi = enhanced_full[py1:py2, px1:px2].copy()
+                    blended_roi = paste.astype(np.float32) * mask_3ch + roi * (1.0 - mask_3ch)
+                    enhanced_full[py1:py2, px1:px2] = blended_roi
+                    enhanced_full = np.clip(enhanced_full, 0, 255).astype(np.uint8)
+
+                    # 在完整图上检测 + embedding 融合
+                    enhanced_faces = self.swapper.detect_faces(enhanced_full, retry_lower_threshold=False)
                     if len(enhanced_faces) > 0:
                         best = max(enhanced_faces, key=lambda f: f.det_score if hasattr(f, 'det_score') else 1.0)
+                        enhanced_emb = getattr(best, 'normed_embedding', None)
+                        if original_src_embedding is not None and enhanced_emb is not None:
+                            fused = (original_src_embedding + enhanced_emb).astype(np.float32)
+                            fused /= np.linalg.norm(fused)
+                            best.normed_embedding = fused
+                            logger.info("视频源人脸预增强完成，融合双 embedding")
+                        else:
+                            logger.info("视频源人脸预增强完成 (无法融合)")
                         source_face = best
-                        logger.info("视频源人脸预增强完成")
+                    else:
+                        # 回退: 裁剪图
+                        enhanced_faces = self.swapper.detect_faces(enhanced_crop, retry_lower_threshold=False)
+                        if len(enhanced_faces) > 0:
+                            best = max(enhanced_faces, key=lambda f: f.det_score if hasattr(f, 'det_score') else 1.0)
+                            enhanced_emb = getattr(best, 'normed_embedding', None)
+                            if original_src_embedding is not None and enhanced_emb is not None:
+                                fused = (original_src_embedding + enhanced_emb).astype(np.float32)
+                                fused /= np.linalg.norm(fused)
+                                best.normed_embedding = fused
+                            source_face = best
+                            logger.info("视频源人脸预增强完成 (裁剪回退)")
             except Exception as e:
                 logger.warning(f"视频源人脸预增强失败，使用原始特征: {e}")
 
@@ -286,6 +339,37 @@ class VideoProcessor:
                                     result = color_transfer(result, frame, mask=mask)
                             except Exception as e:
                                 logger.warning(f"帧 {frame_idx} 颜色迁移失败: {e}")
+
+                        # 眼部 CLAHE+USM+DoG: 整图操作 + 圆形高斯遮罩，无色块
+                        try:
+                            tgt_face = target_faces[tgt_idx]
+                            tgt_lmk = self.swapper._get_landmarks(tgt_face)
+                            if tgt_lmk is not None and len(tgt_lmk) >= 2:
+                                eyes = tgt_lmk[:2].astype(np.int32)
+                                eye_dist = float(np.linalg.norm(eyes[0].astype(float) - eyes[1].astype(float)))
+                                eye_r = max(int(eye_dist * 0.25), 12)
+                                gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
+                                clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(3, 3))
+                                eg = clahe.apply(gray)
+                                blur = cv2.GaussianBlur(eg, (0, 0), 1.5)
+                                usm = cv2.addWeighted(eg, 1.8, blur, -0.8, 0)
+                                fine = cv2.GaussianBlur(usm, (0, 0), 0.5)
+                                coarse = cv2.GaussianBlur(usm, (0, 0), 3.0)
+                                detail = cv2.subtract(fine, coarse)
+                                final_gray = np.clip(usm.astype(float) + detail.astype(float) * 0.4, 0, 255).astype(np.uint8)
+                                hsv = cv2.cvtColor(result, cv2.COLOR_BGR2HSV).astype(float)
+                                eye_mask = np.zeros(result.shape[:2], dtype=np.float32)
+                                for ex, ey in eyes:
+                                    yy, xx = np.ogrid[:result.shape[0], :result.shape[1]]
+                                    dist = np.sqrt((xx - ex)**2 + (yy - ey)**2)
+                                    m = np.clip(1.0 - dist / eye_r, 0, 1)
+                                    m = cv2.GaussianBlur(m, (0, 0), eye_r * 0.35)
+                                    eye_mask = np.maximum(eye_mask, m)
+                                eye_mask = np.clip(eye_mask, 0, 1)
+                                hsv[..., 2] = hsv[..., 2] * (1.0 - eye_mask) + final_gray.astype(float) * eye_mask
+                                result = cv2.cvtColor(hsv.clip(0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR)
+                        except Exception:
+                            pass
 
                         if enhance:
                             result = self.swapper.enhance(result)
