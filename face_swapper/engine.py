@@ -327,46 +327,70 @@ class FaceSwapper:
         source_face = source_faces[source_face_idx]
         target_face = target_faces[target_face_idx]
 
-        # 源人脸预增强: 增强眼部细节 + GFPGAN 提升质量后再提取特征
+        # 源人脸预增强: GFPGAN 提全脸质量 → 眼部多尺度细节增强
         if enhance_source:
             try:
-                # --- 1. 眼部 CLAHE 增强 (让虹膜/睫毛更清晰) ---
-                src_img_enhanced = source_img.copy()
+                from .enhancer import FaceEnhancer
+                from .utils import crop_face
+                if self._enhancer is None:
+                    self._enhancer = FaceEnhancer()
+
+                # --- 1. 先 GFPGAN 增强全脸 (改善整体质量) ---
+                bbox_arr = source_face.bbox.astype(np.int32).flatten()
+                src_face_crop = crop_face(source_img, bbox_arr)
+                enhanced_crop = src_face_crop.copy()
+                if src_face_crop is not None and src_face_crop.size > 0:
+                    gfpgan_result = self._enhancer.enhance(src_face_crop)
+                    if gfpgan_result is not None:
+                        enhanced_crop = gfpgan_result
+
+                # --- 2. 在 GFPGAN 之后的图上做眼部多尺度细节增强 ---
                 src_lmk = self._get_landmarks(source_face)
                 if src_lmk is not None and len(src_lmk) >= 2:
                     src_eyes = src_lmk[:2].astype(np.int32)
                     eye_dist = float(np.linalg.norm(
                         src_eyes[0].astype(float) - src_eyes[1].astype(float)
                     ))
-                    eye_r = max(int(eye_dist * 0.25), 12)
-                    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+                    eye_r = max(int(eye_dist * 0.20), 10)  # 稍大的 ROI
+
                     for ex, ey in src_eyes:
                         x1 = max(0, ex - eye_r)
                         y1 = max(0, ey - eye_r)
-                        x2 = min(source_img.shape[1], ex + eye_r)
-                        y2 = min(source_img.shape[0], ey + eye_r)
-                        roi = src_img_enhanced[y1:y2, x1:x2]
-                        if roi.size > 0:
-                            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-                            enhanced_gray = clahe.apply(gray)
-                            # 用 CLAHE 增强的亮度替换原图亮度 (保留颜色)
-                            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV).astype(float)
-                            hsv[..., 2] = hsv[..., 2] * 0.5 + enhanced_gray.astype(float) * 0.5
-                            src_img_enhanced[y1:y2, x1:x2] = cv2.cvtColor(
-                                hsv.clip(0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR
-                            )
-                    logger.info("眼部 CLAHE 增强完成")
+                        x2 = min(enhanced_crop.shape[1], ex + eye_r)
+                        y2 = min(enhanced_crop.shape[0], ey + eye_r)
+                        roi = enhanced_crop[y1:y2, x1:x2]
+                        if roi.size == 0:
+                            continue
 
-                # --- 2. GFPGAN 增强全脸 ---
-                from .enhancer import FaceEnhancer
-                if self._enhancer is None:
-                    self._enhancer = FaceEnhancer()
-                from .utils import crop_face
-                bbox_arr = source_face.bbox.astype(np.int32).flatten()
-                src_face_crop = crop_face(src_img_enhanced, bbox_arr)
-                if src_face_crop is not None and src_face_crop.size > 0:
-                    enhanced_crop = self._enhancer.enhance(src_face_crop)
-                    # --- 3. 用增强后的源图重新检测 + 提取特征 ---
+                        # 2a. CLAHE 提局部对比度 (虹膜纹理)
+                        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(3, 3))
+                        enhanced_gray = clahe.apply(gray)
+
+                        # 2b. USM 锐化 → 强化双眼皮褶皱、睫毛边缘
+                        blur = cv2.GaussianBlur(enhanced_gray, (0, 0), 1.5)
+                        usm = cv2.addWeighted(enhanced_gray, 1.8, blur, -0.8, 0)
+
+                        # 2c. 细节层提取 & 增强 (DoG: Difference of Gaussians)
+                        fine = cv2.GaussianBlur(usm, (0, 0), 0.5)
+                        coarse = cv2.GaussianBlur(usm, (0, 0), 3.0)
+                        detail = cv2.subtract(fine, coarse)  # 中高频细节 (褶皱、纹理)
+                        detail = cv2.addWeighted(detail, 0, detail, 2.5, 0)  # ×2.5 增强
+
+                        # 2d. 合成: 基础层 + 增强细节
+                        base = usm.astype(float)
+                        detail_boost = detail.astype(float)
+                        final_gray = np.clip(base + detail_boost * 0.4, 0, 255).astype(np.uint8)
+
+                        # 2e. 写回 (保留原色, 只替换 V 通道亮度)
+                        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV).astype(float)
+                        hsv[..., 2] = hsv[..., 2] * 0.3 + final_gray.astype(float) * 0.7
+                        enhanced_crop[y1:y2, x1:x2] = cv2.cvtColor(
+                            hsv.clip(0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR
+                        )
+                    logger.info("眼部多尺度细节增强完成 (CLAHE+USM+DoG)")
+
+                    # --- 3. 用增强后的图重新检测 + 提取特征 ---
                     enhanced_faces = self.detect_faces(enhanced_crop, retry_lower_threshold=False)
                     if len(enhanced_faces) > 0:
                         best = max(enhanced_faces, key=lambda f: f.det_score if hasattr(f, 'det_score') else 1.0)

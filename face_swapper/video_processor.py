@@ -86,43 +86,61 @@ class VideoProcessor:
             )
         source_face = source_faces[source_face_idx]
 
-        # 源人脸预增强: 眼部 CLAHE + GFPGAN 后再提取特征
+        # 源人脸预增强: GFPGAN → 眼部多尺度细节增强
         if enhance_source:
             try:
-                # --- 1. 眼部 CLAHE 增强 ---
-                src_img_enhanced = source_img.copy()
+                from .enhancer import FaceEnhancer
+                from .utils import crop_face
+                enhancer = FaceEnhancer()
+
+                # --- 1. 先 GFPGAN 增强全脸 ---
+                bbox_arr = source_face.bbox.astype(np.int32).flatten()
+                src_face_crop = crop_face(source_img, bbox_arr)
+                enhanced_crop = src_face_crop.copy()
+                if src_face_crop is not None and src_face_crop.size > 0:
+                    gfpgan_result = enhancer.enhance(src_face_crop)
+                    if gfpgan_result is not None:
+                        enhanced_crop = gfpgan_result
+
+                # --- 2. 在 GFPGAN 结果上做眼部多尺度细节增强 ---
                 src_lmk = self.swapper._get_landmarks(source_face)
                 if src_lmk is not None and len(src_lmk) >= 2:
                     src_eyes = src_lmk[:2].astype(np.int32)
                     eye_dist = float(np.linalg.norm(
                         src_eyes[0].astype(float) - src_eyes[1].astype(float)
                     ))
-                    eye_r = max(int(eye_dist * 0.25), 12)
-                    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+                    eye_r = max(int(eye_dist * 0.20), 10)
                     for ex, ey in src_eyes:
                         x1 = max(0, ex - eye_r)
                         y1 = max(0, ey - eye_r)
-                        x2 = min(source_img.shape[1], ex + eye_r)
-                        y2 = min(source_img.shape[0], ey + eye_r)
-                        roi = src_img_enhanced[y1:y2, x1:x2]
-                        if roi.size > 0:
-                            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-                            enhanced_gray = clahe.apply(gray)
-                            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV).astype(float)
-                            hsv[..., 2] = hsv[..., 2] * 0.5 + enhanced_gray.astype(float) * 0.5
-                            src_img_enhanced[y1:y2, x1:x2] = cv2.cvtColor(
-                                hsv.clip(0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR
-                            )
-                    logger.info("视频源人脸眼部 CLAHE 增强完成")
+                        x2 = min(enhanced_crop.shape[1], ex + eye_r)
+                        y2 = min(enhanced_crop.shape[0], ey + eye_r)
+                        roi = enhanced_crop[y1:y2, x1:x2]
+                        if roi.size == 0:
+                            continue
+                        # 2a. CLAHE
+                        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(3, 3))
+                        eg = clahe.apply(gray)
+                        # 2b. USM 锐化
+                        blur = cv2.GaussianBlur(eg, (0, 0), 1.5)
+                        usm = cv2.addWeighted(eg, 1.8, blur, -0.8, 0)
+                        # 2c. DoG 细节提取
+                        fine = cv2.GaussianBlur(usm, (0, 0), 0.5)
+                        coarse = cv2.GaussianBlur(usm, (0, 0), 3.0)
+                        detail = cv2.subtract(fine, coarse)
+                        detail = cv2.addWeighted(detail, 0, detail, 2.5, 0)
+                        # 2d. 合成
+                        base = usm.astype(float)
+                        final_gray = np.clip(base + detail.astype(float) * 0.4, 0, 255).astype(np.uint8)
+                        # 2e. 写回 V 通道
+                        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV).astype(float)
+                        hsv[..., 2] = hsv[..., 2] * 0.3 + final_gray.astype(float) * 0.7
+                        enhanced_crop[y1:y2, x1:x2] = cv2.cvtColor(
+                            hsv.clip(0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR
+                        )
+                    logger.info("视频眼部多尺度细节增强完成 (CLAHE+USM+DoG)")
 
-                # --- 2. GFPGAN 增强全脸 ---
-                from .enhancer import FaceEnhancer
-                from .utils import crop_face
-                enhancer = FaceEnhancer()
-                bbox_arr = source_face.bbox.astype(np.int32).flatten()
-                src_face_crop = crop_face(src_img_enhanced, bbox_arr)
-                if src_face_crop is not None and src_face_crop.size > 0:
-                    enhanced_crop = enhancer.enhance(src_face_crop)
                     enhanced_faces = self.swapper.detect_faces(enhanced_crop, retry_lower_threshold=False)
                     if len(enhanced_faces) > 0:
                         best = max(enhanced_faces, key=lambda f: f.det_score if hasattr(f, 'det_score') else 1.0)
