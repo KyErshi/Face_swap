@@ -267,6 +267,10 @@ class VideoProcessor:
 
             # 时域平滑状态
             prev_face_bbox: Optional[np.ndarray] = None  # (cx, cy, w, h)
+            # 检测间隔优化: 每 N 帧检测一次，中间帧复用上次的人脸框
+            DETECT_INTERVAL = 15  # 每 15 帧检测一次人脸 (0.5s @ 30fps)
+            cached_target_face = None
+            last_detect_frame = -999
 
             while frame_idx < end_frame:
                 ret, frame = cap.read()
@@ -275,36 +279,61 @@ class VideoProcessor:
 
                 # 对帧执行换脸
                 try:
-                    # 检测当前帧中的人脸
-                    target_faces = self.swapper.detect_faces(frame)
+                    detect_ran = False
+                    # 检测当前帧中的人脸 (间隔优化 + 运动回退)
+                    should_detect = (cached_target_face is None
+                                     or (frame_idx - last_detect_frame) >= DETECT_INTERVAL)
+                    # 如果缓存的人脸框位置与上一帧差距过大，强制重检测
+                    if not should_detect and cached_target_face is not None and prev_face_bbox is not None:
+                        cx0, cy0 = prev_face_bbox[:2]
+                        b = cached_target_face.bbox.astype(np.int32).flatten()
+                        cx1 = (b[0] + b[2]) // 2
+                        cy1 = (b[1] + b[3]) // 2
+                        move = np.sqrt((cx1 - cx0)**2 + (cy1 - cy0)**2)
+                        if move > prev_face_bbox[2] * 0.3:  # 移动超过人脸宽30%
+                            should_detect = True
+
+                    if should_detect:
+                        target_faces = self.swapper.detect_faces(frame)
+                        last_detect_frame = frame_idx
+                        detect_ran = True
+                    else:
+                        target_faces = [cached_target_face]
+                        detect_ran = False
 
                     if len(target_faces) > 0:
-                        # 时域追踪: 选择最接近上一帧的人脸 (避免编号漂移)
-                        if temporal_smooth and prev_face_bbox is not None:
-                            prev_cx, prev_cy = prev_face_bbox[:2]
-                            best_idx = 0
-                            best_dist = float("inf")
-                            for i, f in enumerate(target_faces):
-                                b = f.bbox.astype(np.int32).flatten()
-                                cx = (b[0] + b[2]) // 2
-                                cy = (b[1] + b[3]) // 2
-                                dist = (cx - prev_cx) ** 2 + (cy - prev_cy) ** 2
-                                if dist < best_dist:
-                                    best_dist = dist
-                                    best_idx = i
-                            tgt_idx = best_idx
+                        # 时域追踪: 选择最接近上一帧的人脸
+                        if detect_ran:
+                            if temporal_smooth and prev_face_bbox is not None:
+                                prev_cx, prev_cy = prev_face_bbox[:2]
+                                best_idx = 0
+                                best_dist = float("inf")
+                                for i, f in enumerate(target_faces):
+                                    b = f.bbox.astype(np.int32).flatten()
+                                    cx = (b[0] + b[2]) // 2
+                                    cy = (b[1] + b[3]) // 2
+                                    dist = (cx - prev_cx) ** 2 + (cy - prev_cy) ** 2
+                                    if dist < best_dist:
+                                        best_dist = dist
+                                        best_idx = i
+                                tgt_idx = best_idx
+                            else:
+                                tgt_idx = min(target_face_idx, len(target_faces) - 1)
+                            # 缓存本次检测到的人脸
+                            cached_target_face = target_faces[tgt_idx]
                         else:
-                            tgt_idx = min(target_face_idx, len(target_faces) - 1)
+                            tgt_idx = 0  # 只有缓存的单张人脸
 
-                        # 记录当前帧的人脸位置用于下一帧追踪
-                        if temporal_smooth:
-                            b = target_faces[tgt_idx].bbox.astype(np.int32).flatten()
-                            cx = (b[0] + b[2]) // 2
-                            cy = (b[1] + b[3]) // 2
-                            prev_face_bbox = np.array([cx, cy, b[2] - b[0], b[3] - b[1]])
+                        # 更新追踪位置
+                        if temporal_smooth and detect_ran:
+                            b = cached_target_face.bbox.astype(np.int32).flatten()
+                            prev_face_bbox = np.array([
+                                (b[0] + b[2]) // 2, (b[1] + b[3]) // 2,
+                                b[2] - b[0], b[3] - b[1],
+                            ])
 
                         result = self.swapper._swapper.get(
-                            frame, target_faces[tgt_idx], source_face
+                            frame, cached_target_face, source_face
                         )
 
                         if blend:
